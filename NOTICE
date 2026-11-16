@@ -1,0 +1,19 @@
+vector-slam-maze
+Licensed under the MIT License; see LICENSE.
+
+This is version 0.4.1 plus one later change, the cliff guard
+(vector_slam_maze/cliff_guard.py and its use in sdk_session.py). The version
+string in pyproject.toml still reads 0.4.1.
+
+This project is not affiliated with Anki or Digital Dream Labs; Vector is
+their product. No third-party source files or assets are included.
+
+In this published copy the robots' serial numbers, the robot's name and the
+network addresses in defaults, documentation and tests were replaced by
+made-up values (0dd1cafe, 0dd1beef, DEMO, 192.0.2.x). Set VECTOR_SERIAL or
+pass --serial for your own robot. One test's optional check of a private
+script now takes that script's path from CARTOGRAPHER_FRONTIERS_SCRIPT and
+does nothing when it is unset.
+
+README.md refers to findings and backlog entries kept in a private
+workspace. The tests in this repository run offline, with no robot.

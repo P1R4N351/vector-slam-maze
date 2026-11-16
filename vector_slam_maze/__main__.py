@@ -1,0 +1,6 @@
+"""Module entrypoint (`python -m vector_slam_maze`)."""
+
+from .cli import entrypoint
+
+if __name__ == "__main__":
+    entrypoint()
