@@ -332,8 +332,12 @@ def _save_frame_png(path: Path, raw_image: Any) -> None:
 def _write_tum_imu_odom(
     out: Path, rel_paths: List[Tuple[float, str]], odom_samples: Sequence[InertialOdomSample]
 ) -> None:
-    """Write TUM rgb.txt, TUM groundtruth_odom.txt, EuRoC imu.csv, and odom.csv."""
-    rgb_lines = ["# timestamp filename"] + [f"{ts:.6f} {rel}" for ts, rel in rel_paths]
+    """Write TUM rgb.txt (3 header lines for mono_tum.cc), groundtruth_odom.txt, imu.csv, and odom.csv."""
+    rgb_lines = [
+        "# timestamp filename",
+        "# source: vector_slam_maze TUM export",
+        "# format: timestamp_s relative_png_path",
+    ] + [f"{ts:.6f} {rel}" for ts, rel in rel_paths]
     _atomic_write_text(out / "rgb.txt", "\n".join(rgb_lines) + "\n")
     imu_hdr = "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]"
     odom_hdr = "timestamp_s,x_m,y_m,theta_rad,left_wheel_mps,right_wheel_mps,pitch_rad,prox_m,prox_found"
@@ -353,11 +357,41 @@ def _write_tum_imu_odom(
     _atomic_write_text(out / "groundtruth_odom.txt", "\n".join(gt_rows) + "\n")
 
 
+def _orb_slam3_extractor_viewer_lines(
+    n_features: int = 1000, scale_factor: float = 1.2
+) -> list[str]:
+    """Build ORBextractor and Viewer sections for ORB-SLAM3 settings YAML."""
+    assert n_features > 0
+    assert scale_factor > 1.0
+    return [
+        f"ORBextractor.nFeatures: {n_features}",
+        f"ORBextractor.scaleFactor: {scale_factor}",
+        "ORBextractor.nLevels: 8",
+        "ORBextractor.iniThFAST: 20",
+        "ORBextractor.minThFAST: 7",
+        "Viewer.KeyFrameSize: 0.05",
+        "Viewer.KeyFrameLineWidth: 1.0",
+        "Viewer.GraphLineWidth: 0.9",
+        "Viewer.PointSize: 2.0",
+        "Viewer.CameraSize: 0.08",
+        "Viewer.CameraLineWidth: 3.0",
+        "Viewer.ViewpointX: 0.0",
+        "Viewer.ViewpointY: -0.7",
+        "Viewer.ViewpointZ: -1.8",
+        "Viewer.ViewpointF: 500.0",
+        "",
+    ]
+
+
 def _format_orb_slam3_yaml(intr: CameraIntrinsics, fps: float = 15.0) -> str:
-    """Build ORB-SLAM3 Monocular-Inertial settings YAML matching Vector intrinsics."""
+    """Build ORB-SLAM3 Monocular/Monocular-Inertial settings YAML matching Vector intrinsics."""
+    assert intr is not None and intr.width > 0 and intr.height > 0
+    assert math.isfinite(fps) and fps > 0.0
     k = intr.distortion_k
-    return "\n".join([
+    fps_int = max(1, min(60, int(round(fps))))
+    header = [
         "%YAML:1.0",
+        "File.version: \"1.0\"",
         "Camera.type: \"PinHole\"",
         f"Camera1.fx: {intr.fx:.4f}",
         f"Camera1.fy: {intr.fy:.4f}",
@@ -369,23 +403,20 @@ def _format_orb_slam3_yaml(intr: CameraIntrinsics, fps: float = 15.0) -> str:
         f"Camera1.p2: {k[3]:.6f}",
         f"Camera.width: {intr.width}",
         f"Camera.height: {intr.height}",
-        f"Camera.fps: {fps:.2f}",
+        f"Camera.fps: {fps_int}",
         "Camera.RGB: 1",
         "IMU.NoiseGyro: 1.5e-2",
         "IMU.NoiseAcc: 1.5e-1",
         "IMU.GyroWalk: 1.0e-3",
         "IMU.AccWalk: 1.0e-2",
         "IMU.Frequency: 30.0",
-        "Tbc: !!opencv-matrix",
+        "IMU.T_b_c1: !!opencv-matrix",
         "   rows: 4",
         "   cols: 4",
         "   dt: f",
         "   data: [0.0, 0.0, 1.0, 0.035, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.015, 0.0, 0.0, 0.0, 1.0]",
-        "ORBextractor.nFeatures: 800",
-        "ORBextractor.scaleFactor: 1.2",
-        "ORBextractor.nLevels: 6",
-        "",
-    ])
+    ]
+    return "\n".join(header + _orb_slam3_extractor_viewer_lines())
 
 
 def _format_rtabmap_launch() -> str:

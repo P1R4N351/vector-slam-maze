@@ -257,6 +257,63 @@ class TestSensorBridgeAndCharacterize(unittest.TestCase):
         self.assertFalse(payload["high_res_probe"]["captured"])
 
 
+def _make_calm_wake_bot(woken_img: object, undock_calls: list[str]) -> object:
+    """Construct a mock Vector bot starting in calm_power_mode until set_head_angle runs."""
+    assert woken_img is not None and isinstance(undock_calls, list)
+    pose_obj = SimpleNamespace(
+        position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+        rotation=SimpleNamespace(angle_z=SimpleNamespace(radians=0.0)),
+        origin_id=3,
+    )
+    cam = SimpleNamespace(
+        _latest_image=None,
+        config=None,
+        exposure_ms=33,
+        gain=1.0,
+        is_auto_exposure_enabled=True,
+        image_streaming_enabled=lambda: False,
+        capture_single_image=lambda enable_high_resolution=True: SimpleNamespace(raw_image=woken_img.resize((1280, 720))),
+    )
+    bot = SimpleNamespace(
+        camera=cam, pose=pose_obj, gyro=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+        accel=SimpleNamespace(x=0.0, y=0.0, z=9810.0), left_wheel_speed_mmps=0.0,
+        right_wheel_speed_mmps=0.0, pose_pitch_rad=0.0,
+        world=SimpleNamespace(charger=SimpleNamespace(object_id=1, is_visible=False, pose=pose_obj)),
+        status=SimpleNamespace(is_on_charger=True, is_in_calm_power_mode=True, is_charging=False),
+        proximity=SimpleNamespace(last_sensor_reading=SimpleNamespace(distance=SimpleNamespace(distance_mm=300.0), found_object=True, is_lift_in_fov=False)),
+        get_battery_state=lambda: SimpleNamespace(battery_volts=3.56, battery_level=3),
+    )
+
+    def _wake(_ang: object) -> None:
+        bot.status.is_in_calm_power_mode = False
+        cam._latest_image = SimpleNamespace(image_id=11, image_recv_time=10.0, raw_image=woken_img)
+
+    bot.behavior = SimpleNamespace(
+        set_head_angle=_wake, set_lift_height=lambda h: None,
+        drive_off_charger=lambda: (undock_calls.append("undock"), setattr(bot.status, "is_on_charger", False)),
+        drive_straight=lambda *a, **k: None, turn_in_place=lambda *a, **k: None,
+        drive_on_charger=lambda: setattr(bot.status, "is_on_charger", True),
+    )
+    return bot
+
+
+def _fake_calm_session_cls(bot_factory: object) -> type:
+    """Return a context-manager stub wrapping VectorSDKSession(active=...) for CLI tests."""
+    assert callable(bot_factory)
+
+    class _SessionStub:
+        def __init__(self, active: bool = False, **_kw: object) -> None:
+            self.bot = bot_factory(active)
+
+        def __enter__(self) -> object:
+            return self.bot
+
+        def __exit__(self, *a: object) -> None:
+            return None
+
+    return _SessionStub
+
+
 class TestVisualSlamAndDarkGating(unittest.TestCase):
     """Tests for visual ZNCC yaw, darkness gate, loop closure, and relocalization."""
 
@@ -391,6 +448,120 @@ class TestVisualSlamAndDarkGating(unittest.TestCase):
             slam.process_frame(frame, _make_sample_odom(ts, Pose2D(0.0, 0.0, yaw)), ts)
             ts += 0.1
         self.assertAlmostEqual(slam.current_pose.theta_rad, 0.32, delta=0.01)
+        self.assertGreater(len(slam.keyframes), 0)
+
+    def test_calm_wake_characterize_camera_and_yaml(self) -> None:
+        """Verify ORB-SLAM3 YAML header keys and calm-mode docked wake for characterize-camera."""
+        import io
+        from contextlib import redirect_stdout
+        from PIL import Image
+
+        intr = CameraIntrinsics(320, 180, 288.0, 288.0, 155.0, 111.0)
+        yaml_txt = export_slam_dataset.__globals__["_format_orb_slam3_yaml"](intr, fps=14.6)
+        self.assertIn('File.version: "1.0"', yaml_txt)
+        self.assertIn("Camera.fps: 15\n", yaml_txt)
+        self.assertIn("ORBextractor.iniThFAST: 20", yaml_txt)
+        self.assertIn("IMU.T_b_c1: !!opencv-matrix", yaml_txt)
+        self.assertIn("Viewer.ViewpointF: 500.0", yaml_txt)
+
+        lit_img = Image.fromarray(np.clip(_render_pano_view(0.1, intr), 0, 255).astype(np.uint8))
+        undock_calls: list[str] = []
+        sess = _fake_calm_session_cls(lambda _active: _make_calm_wake_bot(lit_img, undock_calls))
+        buf = io.StringIO()
+        with patch("vector_slam_maze.cli_phase2.VectorSDKSession", sess), redirect_stdout(buf):
+            rc = cli.main(["characterize-camera", "--via-vector", "--duration-s", "0.25", "--high-res-probe"])
+        self.assertEqual(rc, 0)
+        rep = json.loads(buf.getvalue())
+        self.assertTrue(rep["ok"])
+        self.assertTrue(rep["high_res_probe"]["captured"])
+        self.assertEqual(rep["high_res_probe"]["width"], 1280)
+        self.assertEqual(undock_calls, [])
+
+    def test_calm_wake_dark_visual_slam_refuses_undock(self) -> None:
+        """Verify visual-slam wakes docked camera in calm mode and aborts before undocking in dark rooms."""
+        import io
+        from contextlib import redirect_stdout
+        from PIL import Image
+
+        dark_img = Image.fromarray(np.full((180, 320), 4, dtype=np.uint8))
+        undock_calls: list[str] = []
+
+        def _make_for_mode(active: bool) -> object:
+            bot = _make_calm_wake_bot(dark_img, undock_calls)
+            if not active:
+                bot.behavior.set_head_angle = lambda *_: None
+            return bot
+
+        buf = io.StringIO()
+        sess = _fake_calm_session_cls(_make_for_mode)
+        with patch("vector_slam_maze.cli_phase2.VectorSDKSession", sess), redirect_stdout(buf):
+            rc = cli.main(["visual-slam", "--via-vector", "--undock-if-needed"])
+        self.assertEqual(rc, 4)
+        self.assertEqual(undock_calls, [])
+        self.assertEqual(json.loads(buf.getvalue())["error"], "dark_room_refuse_undock")
+
+    def test_tum_export_has_three_header_lines(self) -> None:
+        """Verify TUM rgb.txt carries 3 comment lines so ORB-SLAM3 mono_tum loads frame 0."""
+        import tempfile
+
+        intr = CameraIntrinsics(320, 180, 288.0, 288.0, 155.0, 111.0)
+        frames = [(10.0 + i * 0.2, _render_pano_view(i * 0.1, intr)) for i in range(4)]
+        odoms = [_make_sample_odom(10.0 + i * 0.2, Pose2D(0.0, 0.0, 0.0)) for i in range(4)]
+        with tempfile.TemporaryDirectory() as td:
+            ds = Path(td) / "tum"
+            export_slam_dataset(ds, frames, odoms, intr, fps=5.0)
+            lines = (ds / "rgb.txt").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 7)
+        self.assertTrue(all(lines[i].startswith("# ") for i in range(3)))
+        self.assertTrue(lines[3].startswith("10.000000 frames/frame_000000.png"))
+
+    def test_reopen_camera_cancels_feed_before_enabling_streaming(self) -> None:
+        """Verify camera revival cancels _camera_feed_task before EnableImageStreaming(True)."""
+        events: list[str] = []
+        cam = SimpleNamespace(
+            _latest_image=None,
+            _camera_feed_task=SimpleNamespace(done=lambda: False),
+            config=None,
+            init_camera_feed=lambda: events.append("init_camera_feed"),
+        )
+        bot = SimpleNamespace(
+            camera=cam,
+            conn=SimpleNamespace(loop=None),
+            status=SimpleNamespace(is_in_calm_power_mode=False),
+        )
+        with (
+            patch("vector_slam_maze.cli_phase2._cancel_camera_task", side_effect=lambda _r: events.append("cancel")),
+            patch("vector_slam_maze.cli_phase2.enable_robot_image_streaming", side_effect=lambda _r, en: events.append(f"enable:{en}") or True),
+        ):
+            cli_phase2._reopen_camera_stream(bot)
+        self.assertEqual(events, ["cancel", "enable:True", "init_camera_feed"])
+
+    def test_phase2_cliff_hazard_returns_rc6(self) -> None:
+        """Verify characterize-camera and visual-slam return structured rc=6 on CliffHazard."""
+        import io
+        from contextlib import redirect_stdout
+        from vector_slam_maze.cliff_guard import CliffHazard
+
+        class RefusedSess:
+            def __init__(self, **_kw: object) -> None:
+                pass
+
+            def __enter__(self) -> object:
+                raise CliffHazard("parked at edge", hazard="cliff_detected", refused=True)
+
+            def __exit__(self, *a: object) -> None:
+                return None
+
+        buf1, buf2 = io.StringIO(), io.StringIO()
+        with patch("vector_slam_maze.cli_phase2.VectorSDKSession", RefusedSess):
+            with redirect_stdout(buf1):
+                rc1 = cli.main(["characterize-camera", "--via-vector", "--duration-s", "0.2"])
+            with redirect_stdout(buf2):
+                rc2 = cli.main(["visual-slam", "--via-vector"])
+        self.assertEqual(rc1, 6)
+        self.assertEqual(rc2, 6)
+        self.assertEqual(json.loads(buf1.getvalue())["error"], "cliff_detected")
+        self.assertEqual(json.loads(buf2.getvalue())["error"], "cliff_detected")
 
 
 if __name__ == "__main__":

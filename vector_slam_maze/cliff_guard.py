@@ -12,8 +12,8 @@ This module handles what the SDK leaves to the caller after such a reaction:
   it as a CancelledError or as a reply whose action result is not success;
 * control is requested again before the next motion command;
 * forward drives are refused after a cliff until the robot has turned at
-  least CLEAR_TURN_DEG or backed up, so a loop cannot drive at the same edge
-  again;
+  least CLEAR_TURN_DEG or backed up at least CLEAR_BACKUP_MM, so a loop cannot
+  drive at the same edge again;
 * a drive during which a cliff, fall or pick-up was reported raises
   CliffHazard even if the SDK call itself returned.
 
@@ -30,10 +30,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
+import time
 from typing import Any, Optional
 
 CLEAR_TURN_DEG = 45.0
+CLEAR_BACKUP_MM = 30.0  # a shorter reverse does not lift the forward lockout
 CONTROL_TIMEOUT_S = 10.0
+CONTROL_LOSS_SETTLE_POLLS = 20
+CONTROL_LOSS_SETTLE_S = 0.005
 
 # anki_vector RobotStatus bits, read from wirepod_vector_sdk 0.8.1
 # (protocol.RobotStatus) and pinned by a test against the installed SDK.
@@ -43,7 +47,18 @@ STATUS_CLIFF_DETECTED = 0x4000
 
 
 class CliffHazard(RuntimeError):
-    """A motion was stopped or refused because of a cliff, fall or pick-up."""
+    """A motion was stopped or refused because of a cliff, fall or pick-up.
+
+    hazard names what happened (cliff_detected, falling, picked_up,
+    control_lost or action_result_<code>). refused is True when the motion
+    was never started.
+    """
+
+    def __init__(self, message: str, hazard: str = "unknown", refused: bool = False) -> None:
+        super().__init__(message)
+        assert isinstance(hazard, str) and hazard, "hazard name required"
+        self.hazard = hazard
+        self.refused = bool(refused)
 
 
 def hazard_of(status: int) -> Optional[str]:
@@ -101,9 +116,10 @@ class CliffGuard:
             if forward and self._lockout is not None:
                 raise CliffHazard(
                     f"{name} refused: forward motion locked after {self._lockout}; "
-                    f"turn at least {CLEAR_TURN_DEG:.0f} degrees or back up first")
+                    f"turn at least {CLEAR_TURN_DEG:.0f} degrees or back up "
+                    f"at least {CLEAR_BACKUP_MM:.0f} mm first", hazard=self._lockout, refused=True)
             if forward and self._current is not None:
-                raise CliffHazard(f"{name} refused: robot reports {self._current}")
+                raise CliffHazard(f"{name} refused: robot reports {self._current}", hazard=self._current, refused=True)
             self._seen = None
         self._ensure_control()
 
@@ -117,15 +133,31 @@ class CliffGuard:
     def _ensure_control(self) -> None:
         if self._has_control():
             return
-        self._robot.conn.request_control(behavior_control_level=self._priority, timeout=CONTROL_TIMEOUT_S)
+        res = self._robot.conn.request_control(behavior_control_level=self._priority, timeout=CONTROL_TIMEOUT_S)
+        if hasattr(res, "result"):
+            try:
+                res.result(timeout=CONTROL_TIMEOUT_S)
+            except (concurrent.futures.TimeoutError, TimeoutError, concurrent.futures.CancelledError):
+                pass
 
     def _interrupted(self, name: str, why: str) -> CliffHazard:
         with self._lock:
             seen = self._seen or why
             self._lockout = self._lockout or seen
-        return CliffHazard(f"{name} interrupted: {seen}")
+        return CliffHazard(f"{name} interrupted: {seen}", hazard=seen)
+
+    def _await_control_clear(self) -> None:
+        """Wait up to 100 ms for connection.py to clear control_granted_event after _cancel_active."""
+        assert CONTROL_LOSS_SETTLE_POLLS == 20 and CONTROL_LOSS_SETTLE_S > 0.0
+        for _ in range(CONTROL_LOSS_SETTLE_POLLS):
+            if not self._has_control():
+                return
+            time.sleep(CONTROL_LOSS_SETTLE_S)
 
     def _end(self, name: str, clears: bool, result: Any) -> None:
+        if result is None:
+            self._await_control_clear()
+            raise self._interrupted(name, "control_lost")
         code = int(getattr(getattr(result, "result", None), "code", 0) or 0)
         if code != 0:
             raise self._interrupted(name, f"action_result_{code}")
@@ -136,7 +168,7 @@ class CliffGuard:
             if seen is None and clears:
                 self._lockout = None
         if seen is not None:
-            raise CliffHazard(f"{name} stopped: {seen}")
+            raise CliffHazard(f"{name} stopped: {seen}", hazard=seen)
 
     def run(self, name: str, forward: bool, clears: bool, call: Any) -> Any:
         """Run one motion command under the guard."""
@@ -161,7 +193,7 @@ class GuardedBehavior:
 
     def drive_straight(self, distance: Any, speed: Any, *args: Any, **kwargs: Any) -> Any:
         mm = _mm(distance)
-        return self._guard.run("drive_straight", mm > 0, mm < 0,
+        return self._guard.run("drive_straight", mm > 0, mm <= -CLEAR_BACKUP_MM,
                                lambda: self._behavior.drive_straight(distance, speed, *args, **kwargs))
 
     def turn_in_place(self, angle: Any, *args: Any, **kwargs: Any) -> Any:

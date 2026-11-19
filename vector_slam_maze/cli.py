@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .atlas_lock import AtlasLockTimeoutError, atlas_file_lock
 from .cert_onboard import DEFAULT_BOT_SDK_INFO, DEFAULT_SDK_DIR, DEFAULT_SESSION_CERTS_DIR, cmd_onboard_cert
+from .cliff_guard import CliffHazard
 from .landmarks import load_marker_map, register_custom_wall_markers
 from .maze_solver import (
     EAST,
@@ -162,6 +163,12 @@ def _prepare_robot_for_scan(robot: Any, undock_if_needed: bool) -> Tuple[bool, s
     return (True, "ready")
 
 
+def _cliff_cli_payload(exc: CliffHazard) -> Dict[str, Any]:
+    """Build structured JSON payload for CLI commands refused or interrupted by CliffHazard."""
+    reason = "cliff_lockout" if exc.refused else ("cliff" if exc.hazard in ("cliff_detected", "control_lost") else exc.hazard)
+    return {"ok": False, "stopped_reason": reason, "hazard": exc.hazard, "refused": exc.refused, "error": str(exc)}
+
+
 def _try_return_charger(robot: Any) -> str:
     """Turn toward charger if known and drive onto charger safely."""
     from anki_vector.util import radians  # type: ignore
@@ -170,14 +177,16 @@ def _try_return_charger(robot: Any) -> str:
         return "already_on_charger"
     world = getattr(robot, "world", None)
     charger = getattr(world, "charger", None) if world else None
-    if charger is not None and getattr(charger, "pose", None) is not None and getattr(robot, "pose", None) is not None:
-        bp = pose2d_from_sdk_pose(robot.pose)
-        cp = pose2d_from_sdk_pose(charger.pose)
-        if bp.origin_id == cp.origin_id:
-            dth = normalize_angle(math.atan2(cp.y_mm - bp.y_mm, cp.x_mm - bp.x_mm) - bp.theta_rad)
-            robot.behavior.turn_in_place(radians(dth))
     try:
+        if charger is not None and getattr(charger, "pose", None) is not None and getattr(robot, "pose", None) is not None:
+            bp = pose2d_from_sdk_pose(robot.pose)
+            cp = pose2d_from_sdk_pose(charger.pose)
+            if bp.origin_id == cp.origin_id:
+                dth = normalize_angle(math.atan2(cp.y_mm - bp.y_mm, cp.x_mm - bp.x_mm) - bp.theta_rad)
+                robot.behavior.turn_in_place(radians(dth))
         robot.behavior.drive_on_charger()
+    except CliffHazard as exc:
+        return f"dock_cliff:{exc.hazard}"
     except Exception as exc:
         return f"dock_failed:{exc}"
     return "docked" if getattr(getattr(robot, "status", None), "is_on_charger", False) else "dock_attempted"
@@ -196,7 +205,10 @@ def _run_scan_steps(
             return (6, samples, hreason)
         samples.append(_sample_robot_into_atlas(robot, working, tag, assume_canonical=assume_canonical))
         if idx + 1 < steps:
-            robot.behavior.turn_in_place(degrees(float(step_deg)))
+            try:
+                robot.behavior.turn_in_place(degrees(float(step_deg)))
+            except CliffHazard as exc:
+                return (6, samples, "cliff_lockout" if exc.refused else exc.hazard)
     return (0, samples, "ok")
 
 
@@ -207,17 +219,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     steps = max(1, min(int(args.steps), MAX_SCAN_STEPS))
     dock_note = "not_requested"
     baseline, working = _load_atlas_snapshot(atlas_path)
-    with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
-        ready, r_reason = _prepare_robot_for_scan(robot, args.undock_if_needed)
-        if not ready:
-            print(json.dumps({"ok": False, "error": r_reason}))
-            return 3
-        rc_step, step_samples, fail_reason = _run_scan_steps(robot, working, tag, steps, float(args.step_deg), bool(args.assume_docked_canonical))
-        if rc_step != 0:
-            print(json.dumps({"ok": False, "aborted_step": len(step_samples), "reason": fail_reason}))
-            return rc_step
-        if args.return_charger:
-            dock_note = _try_return_charger(robot)
+    try:
+        with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
+            ready, r_reason = _prepare_robot_for_scan(robot, args.undock_if_needed)
+            if not ready:
+                print(json.dumps({"ok": False, "error": r_reason}))
+                return 3
+            rc_step, step_samples, fail_reason = _run_scan_steps(robot, working, tag, steps, float(args.step_deg), bool(args.assume_docked_canonical))
+            if rc_step != 0:
+                print(json.dumps({"ok": False, "aborted_step": len(step_samples), "reason": fail_reason}))
+                return rc_step
+            if args.return_charger:
+                dock_note = _try_return_charger(robot)
+    except CliffHazard as exc:
+        print(json.dumps({"ok": False, "aborted_step": 0, "reason": "cliff_lockout" if exc.refused else exc.hazard, "hazard": exc.hazard, "error": str(exc)}))
+        return 6
     last = step_samples[-1]
     explicit = {s["submap_id"] for s in step_samples} if args.assume_docked_canonical else set()
     rec = {"tag": tag, "kind": "scan", "ts": int(time.time()), "origin_id": last["origin_id"], "submap_id": last["submap_id"]}
@@ -247,17 +263,21 @@ def cmd_rehydrate(args: argparse.Namespace) -> int:
     atlas_path = Path(args.atlas)
     tag = args.session_id or _default_session_tag("rehydrate")
     _baseline, working = _load_atlas_snapshot(atlas_path)
-    with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
-        obs = _sample_robot_into_atlas(robot, working, tag, assume_canonical=args.assume_docked_canonical)
-        sid = obs["submap_id"]
-        before_occ = _count_occ_leaves(extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.0)))
-        created = rehydrate_onboard_obstacles(robot, working, sid, max_boxes=int(args.max_boxes))
-        test_box_created = _create_test_virtual_box(robot) if args.test_box else False
-        time.sleep(1.2)
-        after_leaves = extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.5))
-        after_occ = _count_occ_leaves(after_leaves)
-        if args.cleanup:
-            robot.world.delete_custom_objects(delete_custom_marker_objects=False, delete_fixed_custom_objects=True, delete_custom_object_archetypes=False)
+    try:
+        with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
+            obs = _sample_robot_into_atlas(robot, working, tag, assume_canonical=args.assume_docked_canonical)
+            sid = obs["submap_id"]
+            before_occ = _count_occ_leaves(extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.0)))
+            created = rehydrate_onboard_obstacles(robot, working, sid, max_boxes=int(args.max_boxes))
+            test_box_created = _create_test_virtual_box(robot) if args.test_box else False
+            time.sleep(1.2)
+            after_leaves = extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.5))
+            after_occ = _count_occ_leaves(after_leaves)
+            if args.cleanup:
+                robot.world.delete_custom_objects(delete_custom_marker_objects=False, delete_fixed_custom_objects=True, delete_custom_object_archetypes=False)
+    except CliffHazard as exc:
+        print(json.dumps(_cliff_cli_payload(exc)))
+        return 6
     print(json.dumps({"ok": True, "submap_id": sid, "fixed_boxes_created": created, "test_box_created": test_box_created, "before_occ_leaves": before_occ, "after_occ_leaves": after_occ, "total_leaves_after": len(after_leaves)}, indent=2))
     return 0
 
@@ -309,15 +329,20 @@ def cmd_solve_maze(args: argparse.Namespace) -> int:
     tag = args.session_id or _default_session_tag("maze")
     baseline, working = _load_atlas_snapshot(atlas_path)
     pre_tf_sids = set(working.transforms_to_canonical.keys())
-    with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
-        ready, r_reason = _prepare_robot_for_scan(robot, args.undock_if_needed)
-        if not ready:
-            print(json.dumps({"ok": False, "error": r_reason}))
-            return 3
-        sid = _session_submap_id(tag, pose2d_from_sdk_pose(robot.pose).origin_id)
-        if args.assume_docked_canonical:
-            working.assume_same_frame_as_canonical(sid)
-        res = _dispatch_solve_mode(robot, working, sid, args)
+    try:
+        with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
+            ready, r_reason = _prepare_robot_for_scan(robot, args.undock_if_needed)
+            if not ready:
+                print(json.dumps({"ok": False, "error": r_reason}))
+                return 3
+            sid = _session_submap_id(tag, pose2d_from_sdk_pose(robot.pose).origin_id)
+            if args.assume_docked_canonical:
+                working.assume_same_frame_as_canonical(sid)
+            res = _dispatch_solve_mode(robot, working, sid, args)
+    except CliffHazard as exc:
+        payload = _cliff_cli_payload(exc)
+        print(json.dumps({"ok": False, "mode": args.mode, "result": {"status": "halted", "reason": payload["stopped_reason"], "hazard": exc.hazard, "error": str(exc)}}))
+        return 6
     explicit = {sid} if args.assume_docked_canonical else set()
     if args.marker_map:
         explicit.update(k for k in working.transforms_to_canonical if k not in pre_tf_sids)
@@ -354,13 +379,17 @@ def cmd_act(args: argparse.Namespace) -> int:
         plan = _plan_act_dry_run(verb, payload, float(args.prox_min_mm), strict)
         print(json.dumps(plan))
         return 0 if plan.get("ok") else 6
-    if verb == "halt":
-        with VectorSDKSession(serial=args.serial, active=args.via_vector, via_vector=args.via_vector, enable_nav_map=False) as robot:
-            robot.motors.stop_all_motors()
-        print(json.dumps({"ok": True, "stopped_reason": "halt"}))
-        return 0
-    with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=False) as robot:
-        res = _run_act_motion(robot, verb, payload, float(args.prox_min_mm), strict=strict)
+    try:
+        if verb == "halt":
+            with VectorSDKSession(serial=args.serial, active=args.via_vector, via_vector=args.via_vector, enable_nav_map=False) as robot:
+                robot.motors.stop_all_motors()
+            print(json.dumps({"ok": True, "stopped_reason": "halt"}))
+            return 0
+        with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=False) as robot:
+            res = _run_act_motion(robot, verb, payload, float(args.prox_min_mm), strict=strict)
+    except CliffHazard as exc:
+        print(json.dumps(_cliff_cli_payload(exc)))
+        return 6
     print(json.dumps(res))
     return 0 if res.get("ok") else 6
 
@@ -413,8 +442,12 @@ def cmd_translate(args: argparse.Namespace) -> int:
         plan = plan_directive_batch(data, strict=bool(args.strict), min_prox_mm=prox_min, standoff_mm=standoff) if mode == "directives" else plan_directive(mode, data, strict=bool(args.strict), min_prox_mm=prox_min, standoff_mm=standoff)
         print(json.dumps(plan, indent=2))
         return 0 if plan.get("ok") else 6
-    with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=False) as robot:
-        res = execute_directive_batch(robot, data, min_prox_mm=prox_min, standoff_mm=standoff, strict=bool(args.strict)) if mode == "directives" else execute_bounded_directive(robot, mode, data, min_prox_mm=prox_min, standoff_mm=standoff, strict=bool(args.strict))
+    try:
+        with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=False) as robot:
+            res = execute_directive_batch(robot, data, min_prox_mm=prox_min, standoff_mm=standoff, strict=bool(args.strict)) if mode == "directives" else execute_bounded_directive(robot, mode, data, min_prox_mm=prox_min, standoff_mm=standoff, strict=bool(args.strict))
+    except CliffHazard as exc:
+        print(json.dumps(_cliff_cli_payload(exc), indent=2))
+        return 6
     print(json.dumps(res, indent=2))
     return 0 if res.get("ok") else 6
 

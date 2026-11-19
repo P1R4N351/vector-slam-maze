@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import io
 import math
 import os
 import sys
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
-from .cliff_guard import CliffGuard, GuardedRobot
+from .cliff_guard import CliffGuard, CliffHazard, GuardedRobot
 
 DEFAULT_SERIAL = os.environ.get("VECTOR_SERIAL", "0dd1cafe")
 MAX_NAV_POLL_STEPS = 200
@@ -48,9 +50,10 @@ def check_safety(
 
 def _safe_battery_state(robot: Any) -> Any:
     """Read cached battery state without triggering blocking waits when unavailable."""
+    catch_types = (OSError, RuntimeError, TimeoutError, AttributeError) + _sdk_exception_types()
     try:
         return robot.get_battery_state()
-    except (OSError, RuntimeError, TimeoutError, AttributeError):
+    except catch_types:
         return None
 
 
@@ -163,13 +166,50 @@ def _sdk_exception_types() -> Tuple[type, ...]:
         return ()
 
 
-def capture_high_res_single_image(robot: Any, enable_high_res: bool = True) -> Any:
-    """Capture a single CameraImage (1280x720 when streaming feed is inactive)."""
-    assert robot is not None
+def enable_robot_image_streaming(robot: Any, enable: bool = True, timeout_s: float = 3.0) -> bool:
+    """Explicitly toggle EnableImageStreaming via gRPC when a live connection exists."""
+    assert robot is not None and 0.1 <= timeout_s <= 15.0
+    conn = getattr(robot, "conn", None)
+    grpc_if = getattr(conn, "grpc_interface", None)
+    if grpc_if is None or not hasattr(grpc_if, "EnableImageStreaming") or not hasattr(conn, "run_coroutine"):
+        return False
+    try:
+        from anki_vector.messaging import protocol  # type: ignore
+
+        req = protocol.EnableImageStreamingRequest(enable=bool(enable), enable_high_resolution=False)
+        res = conn.run_coroutine(grpc_if.EnableImageStreaming(req)).result(timeout=timeout_s)
+        return res is not None
+    except (concurrent.futures.TimeoutError, TimeoutError, OSError, RuntimeError) + _sdk_exception_types():
+        return False
+
+
+def capture_high_res_single_image(
+    robot: Any, enable_high_res: bool = True, timeout_s: float = 6.0
+) -> Any:
+    """Capture a single CameraImage with bounded gRPC timeout when streaming feed is off."""
+    assert robot is not None and 0.2 <= timeout_s <= 30.0
     cam = getattr(robot, "camera", None)
-    if cam is None or not hasattr(cam, "capture_single_image"):
+    if cam is None:
         return None
-    catch_types = (OSError, RuntimeError, TimeoutError) + _sdk_exception_types()
+    catch_types = (concurrent.futures.TimeoutError, OSError, RuntimeError, TimeoutError) + _sdk_exception_types()
+    conn = getattr(robot, "conn", None)
+    grpc_if = getattr(conn, "grpc_interface", None)
+    if grpc_if is not None and hasattr(grpc_if, "CaptureSingleImage") and hasattr(conn, "run_coroutine"):
+        try:
+            from PIL import Image
+            from anki_vector.messaging import protocol  # type: ignore
+
+            req = protocol.CaptureSingleImageRequest(enable_high_resolution=bool(enable_high_res))
+            res = conn.run_coroutine(grpc_if.CaptureSingleImage(req)).result(timeout=timeout_s)
+            raw_bytes = getattr(res, "data", b"") if res is not None else b""
+            if not raw_bytes:
+                return None
+            with Image.open(io.BytesIO(raw_bytes)) as im:
+                return SimpleNamespace(raw_image=im.copy(), image_id=int(getattr(res, "image_id", 0)))
+        except catch_types:
+            return None
+    if not hasattr(cam, "capture_single_image"):
+        return None
     try:
         return cam.capture_single_image(enable_high_resolution=enable_high_res)
     except catch_types:
@@ -209,10 +249,25 @@ def safe_disconnect(robot: Any, active: bool = False) -> None:
         _release_active_control(robot)
     _cancel_camera_task(robot)
     _cancel_nav_map_task(robot)
+    catch_types = (concurrent.futures.TimeoutError, OSError, RuntimeError, TimeoutError) + _sdk_exception_types()
     try:
         robot.disconnect()
-    except (OSError, RuntimeError, TimeoutError) as exc:
+    except catch_types as exc:
         print(f"safe_disconnect warning: {exc}", file=sys.stderr)
+        _force_close_transport(robot, catch_types)
+
+
+def _force_close_transport(robot: Any, catch_types: Tuple[type, ...]) -> None:
+    """Close events and conn transports if disconnect aborted mid-teardown."""
+    for attr in ("events", "conn"):
+        comp = getattr(robot, attr, None)
+        close_fn = getattr(comp, "close", None) if comp is not None else None
+        if close_fn is None:
+            continue
+        try:
+            close_fn()
+        except catch_types:
+            pass
 
 
 def _cancel_camera_task(robot: Any) -> None:
@@ -237,17 +292,22 @@ def _cancel_camera_task(robot: Any) -> None:
 
 def _release_active_control(robot: Any) -> None:
     """Stop motors and yield behavior control before socket teardown."""
+    catch_types = (concurrent.futures.TimeoutError, OSError, RuntimeError, TimeoutError) + _sdk_exception_types()
     try:
         motors = getattr(robot, "motors", None)
         if motors is not None:
-            motors.stop_all_motors()
-    except (OSError, RuntimeError, TimeoutError):
+            res = motors.stop_all_motors()
+            if hasattr(res, "result"):
+                res.result(timeout=2.0)
+    except catch_types:
         pass
     try:
         conn = getattr(robot, "conn", None)
         if conn is not None and hasattr(conn, "release_control"):
-            conn.release_control()
-    except (OSError, RuntimeError, TimeoutError):
+            fut = conn.release_control()
+            if hasattr(fut, "result"):
+                fut.result(timeout=2.0)
+    except catch_types:
         pass
 
 
@@ -300,6 +360,29 @@ class VectorSDKSession:
     def __enter__(self) -> Any:
         if self.active:
             self._acquire_lock()
+        try:
+            return self._open()
+        except BaseException:
+            self._abandon()
+            raise
+
+    def _abandon(self) -> None:
+        """Undo a failed __enter__: drop any connection made and release the takeover lock.
+
+        Without this a failed connect left the lock file behind, and every
+        later session for that robot was refused until someone removed it.
+        """
+        robot, self.robot = self.robot, None
+        try:
+            safe_disconnect(robot, active=self.active)
+        except Exception as exc:  # noqa: BLE001 - the failure that brought us here is the one to report
+            print(f"session abandon warning: {type(exc).__name__}", file=sys.stderr)
+        finally:
+            if self._lock_acquired:
+                self._release_lock()
+
+    def _open(self) -> Any:
+        """Connect, start the feeds and, for an active session, return the guarded robot."""
         av = _import_anki_vector()
         # DEFAULT, not OVERRIDE_BEHAVIORS: the override level suppresses the
         # robot's cliff reaction ("will drive off table"). See cliff_guard.
@@ -314,6 +397,8 @@ class VectorSDKSession:
             kwargs["ip"] = self.ip
         self.robot = av.Robot(**kwargs)
         self.robot.connect()
+        if self.active:
+            self._require_control()
         self._start_async_feeds()
         if not self.active:
             return self.robot
@@ -322,6 +407,26 @@ class VectorSDKSession:
         guard.attach(av.events.Events.robot_state)
         return GuardedRobot(self.robot, guard)
 
+    def _require_control(self) -> None:
+        """Refuse an active session the robot has not given control to.
+
+        At DEFAULT priority Vector does not grant control while its cliff flag
+        is set and it is parked at an edge. connect() then returns without
+        control and without raising, and the first behaviour call blocks: on
+        2026-11-15 drive_on_charger blocked for 314 s with the robot
+        motionless. Fail here, before any call can block.
+        """
+        granted = getattr(getattr(self.robot, "conn", None), "control_granted_event", None)
+        if granted is None or granted.is_set():
+            return
+        cliff = bool(getattr(getattr(self.robot, "status", None), "is_cliff_detected", False))
+        why = " while its cliff flag is set; move it away from the edge by hand" if cliff else ""
+        raise CliffHazard(
+            "session refused: the robot did not grant control at DEFAULT priority" + why,
+            hazard="cliff_detected" if cliff else "control_refused",
+            refused=True,
+        )
+
     def _start_async_feeds(self) -> None:
         """Schedule NavMap and camera feed tasks on the robot event loop."""
         loop = getattr(getattr(self.robot, "conn", None), "loop", None)
@@ -329,6 +434,7 @@ class VectorSDKSession:
             fn = lambda: self.robot.nav_map.init_nav_map_feed(frequency=self.nav_freq_hz)
             loop.call_soon_threadsafe(fn) if (loop and hasattr(loop, "call_soon_threadsafe")) else fn()
         if self.enable_camera and hasattr(getattr(self.robot, "camera", None), "init_camera_feed"):
+            enable_robot_image_streaming(self.robot, True)
             cam_fn = self.robot.camera.init_camera_feed
             loop.call_soon_threadsafe(cam_fn) if (loop and hasattr(loop, "call_soon_threadsafe")) else cam_fn()
 

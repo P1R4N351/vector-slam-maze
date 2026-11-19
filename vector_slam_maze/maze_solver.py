@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .cliff_guard import CliffHazard
 from .landmarks import MazeMarkerAnchor
 from .maze_closed_loop import (
+    _sdk_units,
     execute_speed_run_segments,
     fuse_and_localize_step,
     run_floodfill_loop,
@@ -193,17 +195,21 @@ def _mark_obstacle_in_cell(
     grid: MazeGrid, r: int, c: int, dx: float, dy: float, radius_mm: float
 ) -> None:
     """Classify an occupied point near edge vs core inside maze cell (r, c)."""
+    assert grid.cell_size_mm > 0.0 and radius_mm >= 0.0
+    assert grid.in_bounds(r, c)
     edge = grid.cell_size_mm * 0.5 - max(radius_mm * 0.5, 15.0)
     if abs(dx) < edge and abs(dy) < edge:
         grid.blocked[r][c] = True
         return
-    if dy >= edge:
+    # Exclude corner zones (35 mm on 180 mm cell) so one wall tip never spawns side stubs.
+    tangential_limit = grid.cell_size_mm * 0.5 - (35.0 / 180.0) * grid.cell_size_mm
+    if dy >= edge and abs(dx) <= tangential_limit:
         grid.set_wall(r, c, NORTH, True)
-    if dy <= -edge:
+    if dy <= -edge and abs(dx) <= tangential_limit:
         grid.set_wall(r, c, SOUTH, True)
-    if dx >= edge:
+    if dx >= edge and abs(dy) <= tangential_limit:
         grid.set_wall(r, c, EAST, True)
-    if dx <= -edge:
+    if dx <= -edge and abs(dy) <= tangential_limit:
         grid.set_wall(r, c, WEST, True)
 
 
@@ -355,7 +361,7 @@ def execute_wall_follow_run(
     step_mm: float = 120.0,
 ) -> Dict[str, Any]:
     """Execute bounded live Cornell right-wall-follow steps while logging NavMapAtlas."""
-    from anki_vector.util import degrees, distance_mm, speed_mmps  # type: ignore
+    degrees, distance_mm, speed_mmps = _sdk_units()
 
     follower = RightWallFollower(cell_step_mm=step_mm)
     submap = atlas.ensure_submap(submap_id, int(getattr(robot.pose, "origin_id", 0)))
@@ -365,20 +371,24 @@ def execute_wall_follow_run(
         if not ok:
             return {"status": "halted", "reason": reason, "steps": idx, "trace": trace}
         front_mm = float(tel["prox_mm"])
-        robot.behavior.turn_in_place(degrees(-90.0))
-        ok2, reason2, rtel = check_safety(robot, allow_on_charger=False)
-        right_mm = float(rtel["prox_mm"])
-        dec = follower.decide_step(front_mm, right_mm, not ok2)
-        if dec.action == "ABORT_CLIFF":
-            return {"status": "halted", "reason": reason2, "steps": idx, "trace": trace}
-        if dec.action == "TURN_RIGHT_ADVANCE":
-            robot.behavior.drive_straight(distance_mm(step_mm), speed_mmps(60.0))
-        else:
-            robot.behavior.turn_in_place(degrees(90.0))
-            if dec.action == "ADVANCE":
+        try:
+            robot.behavior.turn_in_place(degrees(-90.0))
+            ok2, reason2, rtel = check_safety(robot, allow_on_charger=False)
+            right_mm = float(rtel["prox_mm"])
+            dec = follower.decide_step(front_mm, right_mm, not ok2)
+            if dec.action == "ABORT_CLIFF":
+                return {"status": "halted", "reason": reason2, "steps": idx, "trace": trace}
+            if dec.action == "TURN_RIGHT_ADVANCE":
                 robot.behavior.drive_straight(distance_mm(step_mm), speed_mmps(60.0))
-            elif dec.action == "TURN_LEFT":
+            else:
                 robot.behavior.turn_in_place(degrees(90.0))
+                if dec.action == "ADVANCE":
+                    robot.behavior.drive_straight(distance_mm(step_mm), speed_mmps(60.0))
+                elif dec.action == "TURN_LEFT":
+                    robot.behavior.turn_in_place(degrees(90.0))
+        except CliffHazard as exc:
+            reason = "cliff_lockout" if exc.refused else ("cliff" if exc.hazard in ("cliff_detected", "control_lost") else exc.hazard)
+            return {"status": "halted", "reason": reason, "hazard": exc.hazard, "steps": idx, "trace": trace}
         _fuse_live_step(robot, atlas, submap, submap_id)
         trace.append({"step": idx, "action": dec.action, "front_mm": front_mm, "right_mm": right_mm})
     return {"status": "completed", "reason": "max_steps", "steps": len(trace), "trace": trace}

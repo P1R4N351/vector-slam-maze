@@ -47,20 +47,24 @@ class LeafPatch:
 
 @dataclass
 class CellStats:
-    """Occupancy log-odds and cliff counter for one quantized cell."""
+    """Occupancy log-odds and cliff/floor counters for one quantized cell."""
 
     log_odds: float = 0.0
     cliff_hits: int = 0
     obs_count: int = 0
     last_content: int = int(NavContent.UNKNOWN)
+    floor_obs: int = 0
 
     def apply_content(self, content: int) -> None:
         """Fold a NavNodeContentTypes reading into this cell."""
+        assert int(content) >= 0 and self.obs_count >= 0
         c = int(content)
         self.last_content = c
         if c in (int(NavContent.CLEAR_OF_OBSTACLE), int(NavContent.CLEAR_OF_CLIFF)):
             self.log_odds = max(LOG_ODDS_MIN, self.log_odds - 0.85)
             self.obs_count += 1
+            if c == int(NavContent.CLEAR_OF_CLIFF):
+                self.floor_obs += 1
         elif c in (
             int(NavContent.OBSTACLE_CUBE),
             int(NavContent.OBSTACLE_PROXIMITY),
@@ -80,13 +84,13 @@ class CellStats:
 
     def to_list(self) -> List[Any]:
         """Encode compactly for JSON storage."""
-        return [round(self.log_odds, 4), self.cliff_hits, self.obs_count, self.last_content]
+        return [round(self.log_odds, 4), self.cliff_hits, self.obs_count, self.last_content, self.floor_obs]
 
     @classmethod
     def from_list(cls, raw: List[Any]) -> "CellStats":
         """Restore from compact JSON list."""
         assert isinstance(raw, list) and len(raw) >= 4
-        return cls(float(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+        return cls(float(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]), int(raw[4]) if len(raw) >= 5 else 0)
 
 
 def extract_quadtree_leaves(nav_map_obj: Any) -> List[LeafPatch]:
@@ -128,10 +132,11 @@ def _node_to_leaf(node: Any) -> LeafPatch:
 class SubmapLayer:
     """Sparse planar occupancy grid inside a single session/origin coordinate frame."""
 
-    def __init__(self, cell_mm: float = 20.0, origin_id: int = 0) -> None:
+    def __init__(self, cell_mm: float = 20.0, origin_id: int = 0, robot_id: Optional[str] = None) -> None:
         assert cell_mm > 0.0, "cell_mm must be positive"
         self.cell_mm = float(cell_mm)
         self.origin_id = int(origin_id)
+        self.robot_id: Optional[str] = str(robot_id) if robot_id is not None else None
         self.cells: Dict[Tuple[int, int], CellStats] = {}
 
     def world_to_cell(self, x_mm: float, y_mm: float) -> Tuple[int, int]:
@@ -193,29 +198,71 @@ class SubmapLayer:
     def to_dict(self) -> dict:
         """Serialize submap cells cleanly to JSON dict."""
         encoded = {f"{ix},{iy}": st.to_list() for (ix, iy), st in self.cells.items()}
-        return {"cell_mm": self.cell_mm, "origin_id": self.origin_id, "cells": encoded}
+        payload: Dict[str, Any] = {"cell_mm": self.cell_mm, "origin_id": self.origin_id, "cells": encoded}
+        if self.robot_id is not None:
+            payload["robot_id"] = self.robot_id
+        return payload
 
     @classmethod
     def from_dict(cls, raw: dict) -> "SubmapLayer":
         """Load submap from serialized JSON dict."""
-        layer = cls(cell_mm=float(raw["cell_mm"]), origin_id=int(raw.get("origin_id", 0)))
+        raw_rid = raw.get("robot_id")
+        layer = cls(
+            cell_mm=float(raw["cell_mm"]),
+            origin_id=int(raw.get("origin_id", 0)),
+            robot_id=str(raw_rid) if raw_rid is not None else None,
+        )
         for k, vals in raw.get("cells", {}).items():
             parts = k.split(",", 1)
             layer.cells[(int(parts[0]), int(parts[1]))] = CellStats.from_list(vals)
         return layer
 
 
-def observe_world_anchors(robot: Any) -> Dict[str, Pose2D]:
-    """Read Charger, LightCube, and CustomObjects matching robot.pose.origin_id."""
+_MARKER_STAMP_ATTRS = (
+    "last_observed_time_ns",
+    "last_observed_image_time_stamp",
+    "observed_time_ns",
+    "timestamp_ns",
+    "timestamp",
+)
+
+
+def _marker_observation_meta(robot: Any, obj: Any, ap: Pose2D) -> Dict[str, Any]:
+    """Extract visibility, timestamp/frame freshness, and identity metadata for a marker."""
+    assert obj is not None and ap is not None
+    visible = getattr(obj, "is_visible", None)
+    stamp: Optional[float] = None
+    for attr in _MARKER_STAMP_ATTRS:
+        val = getattr(obj, attr, None)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
+            stamp = float(val)
+            break
+    cam = getattr(robot, "camera", None)
+    latest_img = getattr(cam, "_latest_image", None) if cam is not None else None
+    raw_fid = getattr(latest_img, "image_id", None) if latest_img is not None else None
+    frame_id = int(raw_fid) if isinstance(raw_fid, int) and not isinstance(raw_fid, bool) else None
+    pose_key = (round(ap.x_mm, 4), round(ap.y_mm, 4), round(ap.theta_rad, 6), int(ap.origin_id))
+    assert len(pose_key) == 4
+    return {
+        "is_visible": visible if isinstance(visible, bool) else None,
+        "stamp": stamp,
+        "frame_id": frame_id,
+        "obj_id": id(obj),
+        "pose_key": pose_key,
+    }
+
+
+def _collect_world_anchor_objects(robot: Any) -> List[Tuple[str, Any, Pose2D]]:
+    """Collect (anchor_name, obj, Pose2D) tuples matching robot.pose.origin_id."""
     assert robot is not None, "robot required"
     rpose = pose2d_from_sdk_pose(robot.pose)
     world = getattr(robot, "world", None)
     if world is None:
-        return {}
-    out: Dict[str, Pose2D] = {}
+        return []
+    out: List[Tuple[str, Any, Pose2D]] = []
     candidates: List[Any] = [getattr(world, "charger", None), getattr(world, "connected_light_cube", None)]
-    for obj in list(getattr(world, "visible_objects", []) or []):
-        candidates.append(obj)
+    candidates.extend(list(getattr(world, "visible_objects", []) or []))
+    assert rpose is not None
     for obj in candidates:
         name = anchor_name_from_object(obj)
         sdk_pose = getattr(obj, "pose", None) if obj is not None else None
@@ -223,8 +270,33 @@ def observe_world_anchors(robot: Any) -> Dict[str, Pose2D]:
             continue
         ap = pose2d_from_sdk_pose(sdk_pose, fallback_origin_id=rpose.origin_id)
         if ap.origin_id == rpose.origin_id:
-            out[name] = ap
+            out.append((name, obj, ap))
     return out
+
+
+def observe_world_anchors(robot: Any) -> Dict[str, Pose2D]:
+    """Read Charger, LightCube, and CustomObjects matching robot.pose.origin_id."""
+    assert robot is not None, "robot required"
+    items = _collect_world_anchor_objects(robot)
+    assert isinstance(items, list)
+    return {name: ap for name, _obj, ap in items}
+
+
+def observe_fresh_world_anchors(
+    robot: Any, atlas: "NavMapAtlas", submap_id: str
+) -> Tuple[Dict[str, Pose2D], Dict[str, Pose2D]]:
+    """Read anchors and filter CustomObjectMarkers to strictly fresh, visible sightings."""
+    assert robot is not None and atlas is not None
+    assert isinstance(submap_id, str) and bool(submap_id)
+    all_anchors: Dict[str, Pose2D] = {}
+    fresh_markers: Dict[str, Pose2D] = {}
+    for name, obj, ap in _collect_world_anchor_objects(robot):
+        all_anchors[name] = ap
+        if name.startswith("marker:"):
+            meta = _marker_observation_meta(robot, obj, ap)
+            if atlas.is_fresh_marker_observation(submap_id, name, meta):
+                fresh_markers[name] = ap
+    return (all_anchors, fresh_markers)
 
 
 class NavMapAtlas:
@@ -239,14 +311,66 @@ class NavMapAtlas:
         self.transforms_to_canonical: Dict[str, Transform2D] = {}
         self.marker_obs_counts: Dict[str, int] = {}
         self.marker_outlier_streaks: Dict[str, Tuple[Transform2D, int]] = {}
+        self.marker_last_obs: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.sessions: List[Dict[str, Any]] = []
 
-    def ensure_submap(self, submap_id: str, origin_id: int = 0) -> SubmapLayer:
-        """Create submap if absent; first submap becomes canonical frame."""
+    def is_fresh_marker_observation(
+        self, submap_id: str, anchor_id: str, meta: Dict[str, Any]
+    ) -> bool:
+        """Return True only when marker sighting is visible and newer than prior sighting."""
+        assert isinstance(submap_id, str) and bool(submap_id)
+        assert isinstance(anchor_id, str) and isinstance(meta, dict)
+        if meta.get("is_visible") is False:
+            return False
+        per_sub = self.marker_last_obs.setdefault(submap_id, {})
+        prev = per_sub.get(anchor_id)
+        if prev is not None:
+            if meta.get("stamp") is not None and prev.get("stamp") is not None:
+                if float(meta["stamp"]) <= float(prev["stamp"]):
+                    return False
+            elif meta.get("frame_id") is not None and prev.get("frame_id") is not None:
+                if int(meta["frame_id"]) <= int(prev["frame_id"]):
+                    return False
+            elif meta.get("obj_id") == prev.get("obj_id") and meta.get("pose_key") == prev.get("pose_key"):
+                return False
+        per_sub[anchor_id] = meta
+        return True
+
+    def decay_marker_outlier_streak(self, submap_id: str, decay: int = 1) -> int:
+        """Decay outlier relock streak on frames without marker sightings; return remaining count."""
+        assert isinstance(submap_id, str) and bool(submap_id)
+        assert int(decay) >= 1
+        prior = self.marker_outlier_streaks.get(submap_id)
+        if prior is None:
+            return 0
+        tf_ref, cnt = prior
+        next_cnt = int(cnt) - int(decay)
+        if next_cnt <= 0:
+            self.marker_outlier_streaks.pop(submap_id, None)
+            return 0
+        self.marker_outlier_streaks[submap_id] = (tf_ref, next_cnt)
+        return next_cnt
+
+    def reset_marker_outlier_streak(self, submap_id: str) -> None:
+        """Clear any pending marker relock outlier streak for submap_id."""
+        assert isinstance(submap_id, str) and bool(submap_id)
+        self.marker_outlier_streaks.pop(submap_id, None)
+        assert submap_id not in self.marker_outlier_streaks
+
+    def ensure_submap(
+        self, submap_id: str, origin_id: int = 0, robot_id: Optional[str] = None
+    ) -> SubmapLayer:
+        """Create submap if absent (enforcing robot_id ownership); first becomes canonical."""
         assert submap_id, "submap_id required"
+        rid = str(robot_id) if robot_id is not None else None
         if submap_id not in self.submaps:
-            self.submaps[submap_id] = SubmapLayer(cell_mm=self.cell_mm, origin_id=origin_id)
+            self.submaps[submap_id] = SubmapLayer(cell_mm=self.cell_mm, origin_id=origin_id, robot_id=rid)
             self.anchors.setdefault(submap_id, {})
+        elif rid is not None:
+            existing = self.submaps[submap_id]
+            if existing.robot_id is not None and existing.robot_id != rid:
+                raise ValueError(f"submap {submap_id!r} belongs to robot {existing.robot_id!r}, not {rid!r}")
+            existing.robot_id = rid
         if self.canonical_submap_id is None:
             self.canonical_submap_id = submap_id
             self.transforms_to_canonical[submap_id] = identity_transform()
@@ -380,9 +504,11 @@ class NavMapAtlas:
         assert isinstance(working, NavMapAtlas), "working NavMapAtlas required"
         for sid, w_layer in working.submaps.items():
             b_layer = baseline.submaps.get(sid) if baseline is not None else None
-            if _submap_changed(sid, w_layer, b_layer, sid in self.submaps):
-                dst = self.ensure_submap(sid, w_layer.origin_id)
-                _merge_submap_cells(dst, w_layer, b_layer)
+            changed = _submap_changed(sid, w_layer, b_layer, sid in self.submaps)
+            if changed or (sid in self.submaps and w_layer.robot_id is not None):
+                dst = self.ensure_submap(sid, w_layer.origin_id, robot_id=w_layer.robot_id)
+                if changed:
+                    _merge_submap_cells(dst, w_layer, b_layer)
             self.anchors.setdefault(sid, {}).update(working.anchors.get(sid, {}))
             if sid in working.transforms_to_canonical and _should_copy_tf(self, working, baseline, sid, explicit_tf_sids):
                 self.transforms_to_canonical[sid] = working.transforms_to_canonical[sid]
@@ -398,7 +524,7 @@ def _submap_changed(
         return True
     for k, w_st in w_layer.cells.items():
         b_st = b_layer.cells.get(k)
-        if b_st is None or w_st.obs_count != b_st.obs_count or w_st.cliff_hits != b_st.cliff_hits or abs(w_st.log_odds - b_st.log_odds) > 1e-9:
+        if b_st is None or w_st.obs_count != b_st.obs_count or w_st.cliff_hits != b_st.cliff_hits or w_st.floor_obs != b_st.floor_obs or abs(w_st.log_odds - b_st.log_odds) > 1e-9:
             return True
     return False
 
@@ -421,12 +547,14 @@ def _merge_submap_cells(dst: SubmapLayer, w_layer: SubmapLayer, b_layer: Optiona
         b_st = b_layer.cells.get(k) if b_layer is not None else None
         d_obs = w_st.obs_count - (b_st.obs_count if b_st is not None else 0)
         d_cliff = w_st.cliff_hits - (b_st.cliff_hits if b_st is not None else 0)
+        d_floor = w_st.floor_obs - (b_st.floor_obs if b_st is not None else 0)
         d_lo = w_st.log_odds - (b_st.log_odds if b_st is not None else 0.0)
-        if d_obs == 0 and d_cliff == 0 and abs(d_lo) <= 1e-9:
+        if d_obs == 0 and d_cliff == 0 and d_floor == 0 and abs(d_lo) <= 1e-9:
             continue
         c_dst = dst.cells.setdefault(k, CellStats())
         c_dst.log_odds = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, c_dst.log_odds + d_lo))
         c_dst.cliff_hits = max(0, c_dst.cliff_hits + d_cliff)
+        c_dst.floor_obs = max(0, c_dst.floor_obs + d_floor)
         c_dst.obs_count = max(0, c_dst.obs_count + d_obs)
         c_dst.last_content = w_st.last_content
 
@@ -458,6 +586,7 @@ def _accumulate_transformed_submap(
         dst = out.setdefault((tix, tiy), CellStats())
         dst.log_odds = max(LOG_ODDS_MIN, min(LOG_ODDS_MAX, dst.log_odds + st.log_odds))
         dst.cliff_hits += st.cliff_hits
+        dst.floor_obs += st.floor_obs
         dst.obs_count += st.obs_count
         dst.last_content = st.last_content
 

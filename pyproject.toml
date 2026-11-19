@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vector-slam-maze"
-version = "0.4.1"
+version = "0.4.4"
 description = "Persistent multi-session NavMapGrid + visual-inertial pose-graph SLAM, ROS 2/ORB-SLAM3/RTAB-Map sensor bridge, camera characterization, and maze solver for Anki Vector"
 readme = "README.md"
 license = {text = "MIT"}

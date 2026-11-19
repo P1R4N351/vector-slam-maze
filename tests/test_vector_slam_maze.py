@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vector_slam_maze.landmarks import MazeMarkerAnchor, anchor_name_from_object, localize_from_marker_anchors
 from vector_slam_maze.maze_solver import EAST, NORTH, SOUTH, WEST, FloodFillPlanner, MazeGrid, RightWallFollower
 from vector_slam_maze.navmap_atlas import (
+    CellStats,
     LeafPatch,
     NavMapAtlas,
     SubmapLayer,
@@ -314,6 +315,44 @@ class TestMazeSolversAndSafety(unittest.TestCase):
         )
         leaves = extract_quadtree_leaves(nav)
         self.assertEqual([lf.content for lf in leaves], [0, 0])
+
+
+
+    def test_wall_end_near_a_corner_does_not_block_the_side_edge(self) -> None:
+        atlas = NavMapAtlas(cell_mm=20.0)
+        sub = atlas.ensure_submap("s", 0)
+        for ix in range(-5, 5):
+            sub.cells[(ix, 4)] = sub.cells.get((ix, 4)) or CellStats()
+            sub.cells[(ix, 4)].apply_content(int(NavContent.OBSTACLE_PROXIMITY))
+        grid = MazeGrid.from_atlas(atlas, cell_size_mm=180.0)
+        self.assertEqual(grid.walls[3][2] & (EAST | WEST), 0)
+        self.assertNotEqual(grid.walls[3][2] & SOUTH, 0)
+
+    def test_cell_stats_floor_vs_obstacle_clear_and_submap_robot_id(self) -> None:
+        st_floor = CellStats()
+        st_floor.apply_content(int(NavContent.CLEAR_OF_CLIFF))
+        st_free = CellStats()
+        st_free.apply_content(int(NavContent.CLEAR_OF_OBSTACLE))
+        self.assertEqual(st_floor.floor_obs, 1)
+        self.assertEqual(st_free.floor_obs, 0)
+        self.assertEqual(CellStats.from_list(st_floor.to_list()).floor_obs, 1)
+        self.assertEqual(CellStats.from_list([-0.85, 0, 1, 1]).floor_obs, 0)
+
+        a1 = NavMapAtlas(cell_mm=20.0)
+        s1 = a1.ensure_submap("s1:0", 0, robot_id="vec-a")
+        s1.cells[(0, 0)] = st_floor
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "atlas.json"
+            a1.save(path)
+            loaded = NavMapAtlas.load(path)
+            self.assertEqual(loaded.submaps["s1:0"].robot_id, "vec-a")
+            self.assertEqual(loaded.submaps["s1:0"].cells[(0, 0)].floor_obs, 1)
+        with self.assertRaises(ValueError):
+            a1.ensure_submap("s1:0", 0, robot_id="vec-b")
+        other = NavMapAtlas(cell_mm=20.0)
+        other.ensure_submap("s1:0", 0, robot_id="vec-b")
+        with self.assertRaises(ValueError):
+            a1.merge_session_from(other)
 
 
 if __name__ == "__main__":

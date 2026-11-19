@@ -14,6 +14,7 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .cliff_guard import CliffHazard
 from .sdk_session import check_safety
 from .types_and_math import Pose2D, normalize_angle, pose2d_from_sdk_pose
 
@@ -259,9 +260,16 @@ def bounded_turn(
     if abs(cmd_deg) < TURN_DEADBAND_DEG:
         return MotionResult(True, STOP_COMPLETED, turned_rad=0.0, detail="deadband", clamped=clamped, prox_mm=pre["prox_mm"])
     degrees_fn, _d, _s = _sdk_units()
-    _invoke_turn_in_place(robot.behavior, degrees_fn, cmd_deg, cmd_spd)
+    hazard: Optional[Tuple[str, str]] = None
+    try:
+        _invoke_turn_in_place(robot.behavior, degrees_fn, cmd_deg, cmd_spd)
+    except CliffHazard as exc:
+        hazard = _hazard_stop(exc)
     p1 = _safe_pose(robot)
     ok2, reason2, post = check_safety(robot, allow_on_charger=allow_on_charger, check_front_prox=False)
+    if hazard is not None:  # the guard stopped the turn: report it, with the yaw that was measured
+        swung = _unwrap_turned_rad(p0.theta_rad, p1.theta_rad, cmd_deg) if (p1 is not None and p1.origin_id == p0.origin_id) else 0.0
+        return MotionResult(False, hazard[0], turned_rad=swung, detail=hazard[1], chunks=1, clamped=clamped, prox_mm=post["prox_mm"])
     if p1 is None:
         stop_r = _map_safety_stop(reason2) if not ok2 else STOP_REFUSED
         return MotionResult(False, stop_r, turned_rad=0.0, detail=reason2 if not ok2 else "pose_unavailable", chunks=1, clamped=clamped, prox_mm=post["prox_mm"])
@@ -324,6 +332,23 @@ def _compute_drive_step(
     return (step, False)
 
 
+def _hazard_stop(exc: CliffHazard) -> Tuple[str, str]:
+    """Map a cliff-guard hazard onto (stop reason, detail) for a MotionResult.
+
+    At DEFAULT priority only a mandatory physical reaction takes control away
+    or cancels an action, so lost control and a failed action count as a cliff.
+    """
+    assert isinstance(exc, CliffHazard) and STOP_CLIFF == "cliff"
+    assert isinstance(exc.hazard, str) and exc.hazard
+    if exc.refused:
+        return (STOP_REFUSED, "cliff_lockout")
+    if exc.hazard in ("picked_up", "falling"):
+        return (STOP_REFUSED, exc.hazard)
+    if exc.hazard == "cliff_detected":
+        return (STOP_CLIFF, "cliff")
+    return (STOP_CLIFF, "control_lost")
+
+
 def _run_drive_chunk(
     robot: Any, step_mm: float, sign: float, spd_mmps: float, dist_fn: Any, speed_fn: Any, start_oid: int, tol_opt: Optional[float]
 ) -> Tuple[float, str, str, float]:
@@ -334,9 +359,17 @@ def _run_drive_chunk(
     if p0 is None:
         _ok0, _r0, pre0 = check_safety(robot, allow_on_charger=True, check_front_prox=False)
         return (0.0, STOP_REFUSED, "pose_unavailable", float(pre0["prox_mm"]))
-    robot.behavior.drive_straight(dist_fn(sign * step_mm), speed_fn(spd_mmps))
+    hazard: Optional[Tuple[str, str]] = None
+    try:
+        robot.behavior.drive_straight(dist_fn(sign * step_mm), speed_fn(spd_mmps))
+    except CliffHazard as exc:
+        hazard = _hazard_stop(exc)
     p1 = _safe_pose(robot)
     _ok2, reason2, post = check_safety(robot, allow_on_charger=True, check_front_prox=False)
+    if hazard is not None:  # the guard stopped or refused the chunk: report it, with what was measured
+        same_frame = p1 is not None and (start_oid < 0 or p1.origin_id == start_oid)
+        went = ((p1.x_mm - p0.x_mm) * math.cos(p0.theta_rad) + (p1.y_mm - p0.y_mm) * math.sin(p0.theta_rad)) if same_frame else 0.0
+        return (went, hazard[0], hazard[1], float(post["prox_mm"]))
     if p1 is None:
         if reason2 in ("cliff", "picked_up", "falling"):
             return (0.0, _map_safety_stop(reason2), reason2, float(post["prox_mm"]))

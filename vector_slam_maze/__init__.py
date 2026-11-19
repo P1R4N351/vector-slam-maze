@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, List
 
+from .cliff_guard import CliffGuard, CliffHazard, GuardedRobot
 from .maze_solver import FloodFillPlanner, MazeGrid, RightWallFollower
 from .movement_directives import (
     MotionResult,
@@ -22,7 +23,7 @@ from .movement_directives import (
 from .navmap_atlas import NavMapAtlas, SubmapLayer, compress_occupied_to_boxes, extract_quadtree_leaves
 from .types_and_math import NavContent, Pose2D, Transform2D, fit_se2_from_anchors
 
-__version__ = "0.4.1"
+__version__ = "0.4.4"
 
 _LAZY_EXPORTS = {
     "CameraIntrinsics": "sensor_bridge",
@@ -37,13 +38,20 @@ _LAZY_EXPORTS = {
     "measure_sharpness_tenengrad": "camera_characterize",
     "measure_stream_timing": "camera_characterize",
     "phase_correlate_1d_shift": "camera_characterize",
+    "evaluate_physical_realism": "mechanism_characterize",
+    "fit_braking_response": "mechanism_characterize",
+    "fit_step_response": "mechanism_characterize",
+    "run_mechanism_characterization": "mechanism_characterize",
     "VisualKeyframe": "visual_slam",
     "VisualPoseGraphSLAM": "visual_slam",
 }
 
 __all__ = [
     "CameraIntrinsics",
+    "CliffGuard",
+    "CliffHazard",
     "FloodFillPlanner",
+    "GuardedRobot",
     "MazeGrid",
     "MotionResult",
     "NavContent",
@@ -67,30 +75,36 @@ __all__ = [
     "check_ros2_environment",
     "compress_occupied_to_boxes",
     "estimate_rolling_shutter_metrics",
+    "evaluate_physical_realism",
     "evaluate_visual_vs_odom_drift",
     "execute_bounded_directive",
     "execute_directive_batch",
     "export_slam_dataset",
     "extract_quadtree_leaves",
+    "fit_braking_response",
     "fit_se2_from_anchors",
+    "fit_step_response",
     "load_replay_dataset",
     "measure_sharpness_tenengrad",
     "measure_stream_timing",
     "phase_correlate_1d_shift",
     "plan_directive",
     "plan_directive_batch",
+    "run_mechanism_characterization",
     "synthesize_laserscan_from_tof_and_atlas",
 ]
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily load numpy/Pillow-dependent vision and bridge exports on demand."""
-    assert isinstance(name, str) and len(_LAZY_EXPORTS) == 14
+    """Lazily load optional vision, bridge, and mechanism characterization exports."""
+    assert isinstance(name, str) and len(_LAZY_EXPORTS) == 18
     mod_name = _LAZY_EXPORTS.get(name)
     if mod_name == "sensor_bridge":
         from . import sensor_bridge as mod
     elif mod_name == "camera_characterize":
         from . import camera_characterize as mod
+    elif mod_name == "mechanism_characterize":
+        from . import mechanism_characterize as mod
     elif mod_name == "visual_slam":
         from . import visual_slam as mod
     else:
