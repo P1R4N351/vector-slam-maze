@@ -1,4 +1,4 @@
-"""Tests for the active-session cliff guard. Authored-by: CPCS."""
+"""Tests for the active-session cliff guard."""
 
 from __future__ import annotations
 

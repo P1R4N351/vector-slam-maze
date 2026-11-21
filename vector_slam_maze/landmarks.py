@@ -84,7 +84,7 @@ def register_custom_wall_markers(
 
 
 def anchor_name_from_object(obj: Any) -> Optional[str]:
-    """Produce stable household anchor ID for charger, cube, or custom marker."""
+    """Produce stable anchor ID for charger, cube, or custom marker."""
     if obj is None:
         return None
     arch = getattr(obj, "archetype", None)

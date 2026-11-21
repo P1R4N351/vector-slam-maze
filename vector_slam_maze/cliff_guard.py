@@ -1,4 +1,4 @@
-"""Cliff guard for active SDK sessions. Authored-by: CPCS.
+"""Cliff guard for active SDK sessions.
 
 The session takes behavior control at DEFAULT_PRIORITY, which runs below
 Vector's mandatory physical reactions: when a cliff sensor fires, the robot

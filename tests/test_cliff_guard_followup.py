@@ -1,4 +1,4 @@
-"""The cliff guard as the bounded movement module and the session see it. Authored-by: CPCS.
+"""The cliff guard as the bounded movement module and the session see it.
 
 Three things test_cliff_guard.py does not cover:
   * a move the guard stops or refuses comes back from movement_directives as a

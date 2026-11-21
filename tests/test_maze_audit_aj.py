@@ -1,4 +1,4 @@
-"""Unit tests for GPTPCS-Astra audit findings A-J in maze_closed_loop and navmap_atlas."""
+"""Unit tests for audit findings A-J in maze_closed_loop and navmap_atlas."""
 
 from __future__ import annotations
 
