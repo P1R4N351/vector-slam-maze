@@ -12,6 +12,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .atlas_lock import AtlasLockTimeoutError, atlas_file_lock
+from .basal_persist import BasalConfig, BasalMapDaemon
 from .cert_onboard import DEFAULT_BOT_SDK_INFO, DEFAULT_SDK_DIR, DEFAULT_SESSION_CERTS_DIR, cmd_onboard_cert
 from .cliff_guard import CliffHazard
 from .landmarks import load_marker_map, register_custom_wall_markers
@@ -32,13 +33,14 @@ from .movement_directives import (
 )
 from .navmap_atlas import (
     NavMapAtlas,
+    canonical_charger_pose,
     compress_occupied_to_boxes,
     extract_quadtree_leaves,
     observe_world_anchors,
     rehydrate_onboard_obstacles,
 )
 from .rosbag_export import cmd_export_rosbag
-from .sdk_session import DEFAULT_SERIAL, VectorSDKSession, check_safety, poll_latest_nav_map
+from .sdk_session import DEFAULT_SERIAL, VectorSDKSession, check_safety, poll_fresh_nav_map, poll_latest_nav_map
 from .types_and_math import normalize_angle, pose2d_from_sdk_pose
 
 DEFAULT_ATLAS = Path(os.environ.get("VECTOR_ATLAS_PATH", "/home/pi/maps/demo-persistent-atlas.json"))
@@ -258,33 +260,95 @@ def _create_test_virtual_box(robot: Any) -> bool:
     return obj is not None
 
 
+def _execute_rehydrate_session(
+    robot: Any, working: NavMapAtlas, tag: str, args: argparse.Namespace
+) -> Dict[str, Any]:
+    """Run live rehydrate sequence on an open active robot session."""
+    assert robot is not None and isinstance(working, NavMapAtlas)
+    obs = _sample_robot_into_atlas(robot, working, tag, assume_canonical=args.assume_docked_canonical)
+    sid = obs["submap_id"]
+    before_grid = poll_latest_nav_map(robot, max_wait_s=1.0)
+    before_leaves = extract_quadtree_leaves(before_grid)
+    created = rehydrate_onboard_obstacles(
+        robot,
+        working,
+        sid,
+        max_boxes=int(args.max_boxes),
+        robot_pose_bot=pose2d_from_sdk_pose(robot.pose),
+        charger_pose_can=canonical_charger_pose(working),
+    )
+    test_box_created = _create_test_virtual_box(robot) if args.test_box else False
+    after_grid, fresh_broadcast = poll_fresh_nav_map(robot, max_wait_s=3.0, after_map=before_grid)
+    after_leaves = extract_quadtree_leaves(after_grid)
+    if args.cleanup:
+        robot.world.delete_custom_objects(
+            delete_custom_marker_objects=False,
+            delete_fixed_custom_objects=True,
+            delete_custom_object_archetypes=False,
+        )
+    return {
+        "ok": True,
+        "submap_id": sid,
+        "fixed_boxes_created": created,
+        "test_box_created": test_box_created,
+        "fresh_broadcast": fresh_broadcast,
+        "before_occ_leaves": _count_occ_leaves(before_leaves),
+        "after_occ_leaves": _count_occ_leaves(after_leaves),
+        "obstacle_cube_leaves_before": _count_cube_leaves(before_leaves),
+        "obstacle_cube_leaves_after": _count_cube_leaves(after_leaves),
+        "total_leaves_after": len(after_leaves),
+    }
+
+
 def cmd_rehydrate(args: argparse.Namespace) -> int:
     """Inject persisted obstacles into onboard origin without holding disk lock during robot IO."""
+    assert args is not None and args.atlas
     atlas_path = Path(args.atlas)
     tag = args.session_id or _default_session_tag("rehydrate")
     _baseline, working = _load_atlas_snapshot(atlas_path)
     try:
         with VectorSDKSession(serial=args.serial, active=True, via_vector=args.via_vector, enable_nav_map=True) as robot:
-            obs = _sample_robot_into_atlas(robot, working, tag, assume_canonical=args.assume_docked_canonical)
-            sid = obs["submap_id"]
-            before_occ = _count_occ_leaves(extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.0)))
-            created = rehydrate_onboard_obstacles(robot, working, sid, max_boxes=int(args.max_boxes))
-            test_box_created = _create_test_virtual_box(robot) if args.test_box else False
-            time.sleep(1.2)
-            after_leaves = extract_quadtree_leaves(poll_latest_nav_map(robot, max_wait_s=1.5))
-            after_occ = _count_occ_leaves(after_leaves)
-            if args.cleanup:
-                robot.world.delete_custom_objects(delete_custom_marker_objects=False, delete_fixed_custom_objects=True, delete_custom_object_archetypes=False)
+            out = _execute_rehydrate_session(robot, working, tag, args)
     except CliffHazard as exc:
         print(json.dumps(_cliff_cli_payload(exc)))
         return 6
-    print(json.dumps({"ok": True, "submap_id": sid, "fixed_boxes_created": created, "test_box_created": test_box_created, "before_occ_leaves": before_occ, "after_occ_leaves": after_occ, "total_leaves_after": len(after_leaves)}, indent=2))
+    print(json.dumps(out, indent=2))
     return 0
 
 
 def _count_occ_leaves(leaves: list) -> int:
     """Count obstacle leaves (types 3..7) in a leaf list."""
     return sum(1 for lf in leaves if int(lf.content) in (3, 4, 5, 6, 7))
+
+
+def _count_cube_leaves(leaves: list) -> int:
+    """Count Object/FixedCustomObject obstacle leaves (content == 3)."""
+    return sum(1 for lf in leaves if int(lf.content) == 3)
+
+
+def cmd_basal_daemon(args: argparse.Namespace) -> int:
+    """Run passive NavMap + seated SQLite + NavMapAtlas persistence daemon."""
+    assert args is not None and args.serial and int(args.max_ticks) > 0
+    export_dir = Path(args.export_dir) if args.export_dir else None
+    cfg = BasalConfig(
+        serial=str(args.serial),
+        atlas_path=Path(args.atlas),
+        export_dir=export_dir,
+        sqlite_path=Path(args.sqlite) if args.sqlite else None,
+        navmap_json_path=Path(args.export_navmap_json) if args.export_navmap_json else None,
+        pod_url=args.pod_url,
+        ip=args.ip,
+        session_id=args.session_id,
+        nav_freq_hz=float(args.nav_freq_hz),
+        poll_sleep_s=float(args.poll_sleep_s),
+        state_stale_s=float(args.state_stale_s),
+        export_interval_s=float(args.export_interval_s),
+        max_ticks=int(args.max_ticks),
+        ensure_pod_timeouts=bool(args.ensure_pod_timeouts),
+        rehydrate_on_new_origin=bool(args.rehydrate_on_new_origin),
+        max_rehydrate_boxes=int(args.max_boxes),
+    )
+    return BasalMapDaemon(cfg).run()
 
 
 def cmd_plan_maze(args: argparse.Namespace) -> int:
@@ -500,22 +564,32 @@ def _add_maze_subparsers(sub: Any) -> None:
     _add_translate_subparser(sub)
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    """Construct CLI parser for all vector-slam subcommands."""
-    p = argparse.ArgumentParser(prog="vector-slam", description="Anki Vector persistent SLAM + maze solver")
-    p.add_argument("--serial", default=DEFAULT_SERIAL)
-    p.add_argument("--atlas", default=str(DEFAULT_ATLAS))
-    p.add_argument("--export-dir", default=str(DEFAULT_EXPORT_DIR))
-    p.add_argument("--session-id", default=None)
-    p.add_argument("--assume-docked-canonical", action="store_true")
-    sub = p.add_subparsers(dest="cmd", required=True)
-    sp = sub.add_parser("probe")
-    sp.add_argument("--wait-s", type=float, default=1.2)
+def _add_basal_subparser(sub: Any) -> None:
+    """Register passive basal-daemon subcommand for persistent MemoryMap sync."""
+    assert sub is not None
+    sb_d = sub.add_parser("basal-daemon")
+    sb_d.add_argument("--pod-url", default=None)
+    sb_d.add_argument("--ip", default=None)
+    sb_d.add_argument("--sqlite", default=None)
+    sb_d.add_argument("--export-navmap-json", default=None)
+    sb_d.add_argument("--nav-freq-hz", type=float, default=1.0)
+    sb_d.add_argument("--poll-sleep-s", type=float, default=0.5)
+    sb_d.add_argument("--state-stale-s", type=float, default=45.0)
+    sb_d.add_argument("--export-interval-s", type=float, default=30.0)
+    sb_d.add_argument("--max-ticks", type=int, default=172800)
+    sb_d.add_argument("--ensure-pod-timeouts", action="store_true")
+    sb_d.add_argument("--rehydrate-on-new-origin", action="store_true")
+    sb_d.add_argument("--max-boxes", type=int, default=24)
+
+
+def _add_map_subparsers(sub: Any) -> None:
+    """Register probe, snapshot, scan, rehydrate, onboard-cert, and export-rosbag subcommands."""
+    assert sub is not None
+    sub.add_parser("probe").add_argument("--wait-s", type=float, default=1.2)
     sub.add_parser("snapshot")
     ss = sub.add_parser("scan")
-    ss.add_argument("--via-vector", action="store_true")
-    ss.add_argument("--undock-if-needed", action="store_true")
-    ss.add_argument("--return-charger", action="store_true")
+    for flg in ("--via-vector", "--undock-if-needed", "--return-charger"):
+        ss.add_argument(flg, action="store_true")
     ss.add_argument("--steps", type=int, default=8)
     ss.add_argument("--step-deg", type=float, default=45.0)
     sr = sub.add_parser("rehydrate")
@@ -523,7 +597,6 @@ def _build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--max-boxes", type=int, default=24)
     sr.add_argument("--test-box", action="store_true")
     sr.add_argument("--cleanup", action="store_true")
-    _add_maze_subparsers(sub)
     so = sub.add_parser("onboard-cert")
     so.add_argument("--bot-sdk-info", default=str(DEFAULT_BOT_SDK_INFO))
     so.add_argument("--session-certs-dir", default=str(DEFAULT_SESSION_CERTS_DIR))
@@ -538,9 +611,24 @@ def _build_parser() -> argparse.ArgumentParser:
     sb.add_argument("--samples-json", default=None)
     sb.add_argument("--out-bag", required=True)
     sb.add_argument("--storage", choices=["sqlite3", "mcap"], default="sqlite3")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct CLI parser for all vector-slam subcommands."""
+    p = argparse.ArgumentParser(prog="vector-slam", description="Anki Vector persistent SLAM + maze solver")
+    p.add_argument("--serial", default=DEFAULT_SERIAL)
+    p.add_argument("--atlas", default=str(DEFAULT_ATLAS))
+    p.add_argument("--export-dir", default=str(DEFAULT_EXPORT_DIR))
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--assume-docked-canonical", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    _add_map_subparsers(sub)
+    _add_maze_subparsers(sub)
+    _add_basal_subparser(sub)
     from .cli_phase2 import add_phase2_subparsers
 
     add_phase2_subparsers(sub)
+    assert sub is not None
     return p
 
 
@@ -550,7 +638,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     from .cli_phase2 import phase2_dispatch
 
-    dispatch = {"probe": cmd_probe, "snapshot": cmd_snapshot, "scan": cmd_scan, "rehydrate": cmd_rehydrate, "plan-maze": cmd_plan_maze, "solve-maze": cmd_solve_maze, "act": cmd_act, "translate": cmd_translate, "onboard-cert": cmd_onboard_cert, "export-rosbag": cmd_export_rosbag}
+    dispatch = {
+        "probe": cmd_probe,
+        "snapshot": cmd_snapshot,
+        "scan": cmd_scan,
+        "rehydrate": cmd_rehydrate,
+        "basal-daemon": cmd_basal_daemon,
+        "plan-maze": cmd_plan_maze,
+        "solve-maze": cmd_solve_maze,
+        "act": cmd_act,
+        "translate": cmd_translate,
+        "onboard-cert": cmd_onboard_cert,
+        "export-rosbag": cmd_export_rosbag,
+    }
     dispatch.update(phase2_dispatch())
     try:
         return dispatch[args.cmd](args)

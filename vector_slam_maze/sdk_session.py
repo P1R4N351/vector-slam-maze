@@ -111,19 +111,31 @@ def _evaluate_hazard(
     return "ok"
 
 
-def poll_latest_nav_map(robot: Any, max_wait_s: float = 2.5, step_s: float = 0.1) -> Any:
-    """Poll robot.nav_map._latest_nav_map without blocking on latest_nav_map."""
+def poll_fresh_nav_map(
+    robot: Any, max_wait_s: float = 2.5, step_s: float = 0.1, after_map: Any = None
+) -> Tuple[Any, bool]:
+    """Poll robot.nav_map._latest_nav_map without blocking; if after_map given, wait for a new broadcast."""
     assert robot is not None and max_wait_s >= 0.0 and step_s > 0.0
     max_iters = min(MAX_NAV_POLL_STEPS, max(1, int(round(max_wait_s / step_s)) + 1))
     nav = getattr(robot, "nav_map", None)
     if nav is None:
-        return None
+        return (None, False)
+    cur = None
     for _ in range(max_iters):
         cur = getattr(nav, "_latest_nav_map", None)
-        if cur is not None:
-            return cur
+        if cur is not None and (after_map is None or cur is not after_map):
+            return (cur, True)
         time.sleep(step_s)
-    return getattr(nav, "_latest_nav_map", None)
+    cur = getattr(nav, "_latest_nav_map", None)
+    return (cur, cur is not None and (after_map is None or cur is not after_map))
+
+
+def poll_latest_nav_map(
+    robot: Any, max_wait_s: float = 2.5, step_s: float = 0.1, after_map: Any = None
+) -> Any:
+    """Poll robot.nav_map._latest_nav_map without blocking on latest_nav_map."""
+    grid, _fresh = poll_fresh_nav_map(robot, max_wait_s=max_wait_s, step_s=step_s, after_map=after_map)
+    return grid
 
 
 def _read_camera_image_nonblocking(cam: Any) -> Any:
