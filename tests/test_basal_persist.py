@@ -88,24 +88,33 @@ class _FakeEvents:
 
 
 class _FakeWorld:
-    """Minimal world stub tracking fixed custom objects created during rehydration."""
+    """Minimal world stub mirroring anki_vector.world.World._objects / visible_objects."""
 
     def __init__(self) -> None:
         self.fixed_calls: list[dict[str, object]] = []
         self.deleted_fixed = 0
         self.charger = None
         self.connected_light_cube = None
-        self.visible_objects: list[object] = []
+        self._objects: dict[int, object] = {}
+
+    @property
+    def visible_objects(self) -> list[object]:
+        """Mirror anki_vector/world.py:213 by reading obj.is_visible directly."""
+        return [obj for obj in self._objects.values() if obj.is_visible]
 
     def delete_custom_objects(self, **kwargs: object) -> None:
         assert "delete_fixed_custom_objects" in kwargs
         if kwargs.get("delete_fixed_custom_objects"):
             self.deleted_fixed += 1
+            for k in [k for k, v in self._objects.items() if not hasattr(v, "is_visible")]:
+                del self._objects[k]
 
     def create_custom_fixed_object(self, pose: object, **kwargs: object) -> SimpleNamespace:
         assert pose is not None
         self.fixed_calls.append({"pose": pose, **kwargs})
-        return SimpleNamespace(pose=pose, **kwargs)
+        obj = SimpleNamespace(pose=pose, **kwargs)
+        self._objects[id(obj)] = obj
+        return obj
 
 
 class _FakeBattery:
@@ -485,3 +494,21 @@ class TestBasalPersist(unittest.TestCase):
             res = json.loads(buf.getvalue())
             self.assertTrue(res["fresh_broadcast"])
             self.assertEqual((res["obstacle_cube_leaves_before"], res["obstacle_cube_leaves_after"]), (0, 1))
+
+    def test_observe_world_anchors_survives_fixed_custom_object_without_is_visible(self) -> None:
+        from vector_slam_maze.navmap_atlas import observe_world_anchors
+
+        class LightCube:
+            def __init__(self, pose: object) -> None:
+                self.object_id = 42
+                self.is_visible = True
+                self.pose = pose
+
+        robot = _FakeRobot(origin_id=1)
+        robot.world.create_custom_fixed_object(_make_pose(300.0, 0.0, 0.0, 1), name="rehyd_0")
+        robot.world._objects[999] = LightCube(_make_pose(220.0, -40.0, 0.25, 1))
+        with self.assertRaises(AttributeError):
+            _ = robot.world.visible_objects
+        anchors = observe_world_anchors(robot)
+        self.assertIn("cube:42", anchors)
+        self.assertAlmostEqual(anchors["cube:42"].x_mm, 220.0, places=3)

@@ -27,6 +27,7 @@ MAX_BFS_HOPS = 1024
 MAX_GRID_DIM = 2048
 MAX_REHYDRATE_BOXES = 64
 MAX_REHYDRATE_CELLS = 65536
+MAX_WORLD_OBJECTS = 512
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
 OCC_THRESHOLD = 0.4
@@ -252,6 +253,29 @@ def _marker_observation_meta(robot: Any, obj: Any, ap: Pose2D) -> Dict[str, Any]
     }
 
 
+def _iter_visible_world_objects(world: Any) -> List[Any]:
+    """Collect visible objects without crashing on FixedCustomObject in anki_vector."""
+    assert world is not None
+    raw_objs = getattr(world, "_objects", None)
+    seq: Any = tuple(raw_objs.values()) if isinstance(raw_objs, dict) else None
+    default_vis = False
+    if seq is None:
+        default_vis = True
+        try:
+            seq = getattr(world, "visible_objects", None)
+        except AttributeError:
+            return []
+        if seq is None:
+            return []
+    out: List[Any] = []
+    for idx, obj in enumerate(seq):
+        if idx >= MAX_WORLD_OBJECTS:
+            break
+        if bool(getattr(obj, "is_visible", default_vis)):
+            out.append(obj)
+    return out
+
+
 def _collect_world_anchor_objects(robot: Any) -> List[Tuple[str, Any, Pose2D]]:
     """Collect (anchor_name, obj, Pose2D) tuples matching robot.pose.origin_id."""
     assert robot is not None, "robot required"
@@ -261,7 +285,7 @@ def _collect_world_anchor_objects(robot: Any) -> List[Tuple[str, Any, Pose2D]]:
         return []
     out: List[Tuple[str, Any, Pose2D]] = []
     candidates: List[Any] = [getattr(world, "charger", None), getattr(world, "connected_light_cube", None)]
-    candidates.extend(list(getattr(world, "visible_objects", []) or []))
+    candidates.extend(_iter_visible_world_objects(world))
     assert rpose is not None
     for obj in candidates:
         name = anchor_name_from_object(obj)

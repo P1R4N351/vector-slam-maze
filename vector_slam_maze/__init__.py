@@ -36,7 +36,7 @@ from .navmap_atlas import (
 )
 from .types_and_math import NavContent, Pose2D, Transform2D, fit_se2_from_anchors
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 _LAZY_EXPORTS = {
     "CameraIntrinsics": "sensor_bridge",
