@@ -2,8 +2,13 @@
 
 Persistent multi-session SLAM atlas, fiducial `SE(2)` frame stitching, ROS Cartographer `grid.pgm` / `grid.yaml` export, micromouse flood-fill + wall-following maze solver, and Phase 2 classical visual pose-graph SLAM + ROS 2 / TUM / EuRoC sensor bridge for Anki/DDL Vector.
 
-## Capabilities (`v0.4.3`)
+## Capabilities (`v0.5.0`)
 
+- **Persistent Basal `MemoryMap` & Origin Rehydration (`v0.5.0`, `basal_persist.py`, `navmap_atlas.py`, `sdk_session.py`, `cli.py`)**:
+  - Adds passive `basal-daemon [--pod-url URL] [--ip HOST] [--sqlite PATH] [--export-navmap-json PATH] [--ensure-pod-timeouts] [--rehydrate-on-new-origin]` subscribing to `NavMapGrid` broadcasts and `RobotState` heartbeats without blocking idle feeds (eliminating 45 s `TimeoutError` crashes when stationary/docked).
+  - Writes seated `10 mm` occupancy SQLite stores (`revisions`, `seated`) and atomic `seated_robot` `NavMap` JSON exports alongside incremental `NavMapAtlas` (`INTERESTING_EDGE` delta-baselined without spurious log-odds creep) and ROS `grid.pgm` / `grid.yaml` updates.
+  - Rehydrates canonical obstacles across `origin_id` resets using `FixedCustomObject` with robot (`110 mm` radius) and charger-corridor (`-40..220 x -90..90 mm` 2D SAT) clearance exclusions, gating off during `calm_power_mode` or pod sleep-mute mode (`GET /api-sdk/cryo_mute`), and optionally asserting pod `MemoryMap` timeout persistence (`POST /api-sdk/basal_map?enable=true`).
+  - Upgrades `rehydrate` CLI and `sdk_session.poll_fresh_nav_map(..., after_map=prev)` to wait specifically for a post-injection `NavMapGrid` broadcast and report `content == 3` (`OBSTACLE_CUBE`) leaf counts directly.
 - **4-Mechanism Physical Characterization & Teardown Hardening (`v0.4.3`, `mechanism_characterize.py`, `cli_phase2.py`, `sdk_session.py`)**:
   - Adds `characterize-mechanisms --via-vector [--docked-only | --include-wheels --confirm-safe-floor] [--allow-occluded-tof] [--ip HOST] [--out FILE]` (exiting `0` when `evaluate_physical_realism` passes or `rc=6` on safety/realism failure) to empirically measure transport latency, `10-90%` rise time (`rise_10_90_ms`), effective time constant (`tau_eff_ms`), overshoot (`%`), steady-state error, unpowered gravity-hold drift, high-speed tread braking distance, and closed-loop `80 mm` drive / `60°` turn accuracy across `head`, `lift`, `left_wheel`, and `right_wheel`.
   - Hardens `safe_disconnect` / `_release_active_control` / `_force_close_transport` in `sdk_session.py` to await `release_control()` futures (`2.0 s` timeout), catch `_sdk_exception_types()`, and force-close `events` / `conn` transports if `robot.disconnect()` aborts mid-teardown after cliff/control loss.
@@ -54,6 +59,9 @@ python3 -m vector_slam_maze --atlas /tmp/vslam-atlas.json visual-relocalize --re
 
 # Persist passive NavMap snapshot + export ROS grid.pgm / grid.yaml
 python3 -m vector_slam_maze --serial 0dd1cafe --assume-docked-canonical snapshot
+
+# Passive multi-session basal MemoryMap daemon (SQLite + simulator JSON + atlas + pod timeouts)
+python3 -m vector_slam_maze --serial 00000000 --atlas /tmp/basal-atlas.json --export-dir /tmp/basal-ros basal-daemon --pod-url http://127.0.0.1:8080 --sqlite /tmp/native.sqlite --export-navmap-json /tmp/shelf-navmap.json --ensure-pod-timeouts --rehydrate-on-new-origin
 
 # Authorized 360-degree visual + ToF + NavMap scan (refuses rc=4 if dark/calm unless --force-dark)
 python3 -m vector_slam_maze --serial 0dd1cafe --assume-docked-canonical visual-slam --via-vector --undock-if-needed --return-charger

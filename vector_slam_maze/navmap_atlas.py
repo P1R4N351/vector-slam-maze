@@ -27,6 +27,7 @@ MAX_BFS_HOPS = 1024
 MAX_GRID_DIM = 2048
 MAX_REHYDRATE_BOXES = 64
 MAX_REHYDRATE_CELLS = 65536
+MAX_WORLD_OBJECTS = 512
 LOG_ODDS_MIN = -5.0
 LOG_ODDS_MAX = 5.0
 OCC_THRESHOLD = 0.4
@@ -252,6 +253,29 @@ def _marker_observation_meta(robot: Any, obj: Any, ap: Pose2D) -> Dict[str, Any]
     }
 
 
+def _iter_visible_world_objects(world: Any) -> List[Any]:
+    """Collect visible objects without crashing on FixedCustomObject in anki_vector."""
+    assert world is not None
+    raw_objs = getattr(world, "_objects", None)
+    seq: Any = tuple(raw_objs.values()) if isinstance(raw_objs, dict) else None
+    default_vis = False
+    if seq is None:
+        default_vis = True
+        try:
+            seq = getattr(world, "visible_objects", None)
+        except AttributeError:
+            return []
+        if seq is None:
+            return []
+    out: List[Any] = []
+    for idx, obj in enumerate(seq):
+        if idx >= MAX_WORLD_OBJECTS:
+            break
+        if bool(getattr(obj, "is_visible", default_vis)):
+            out.append(obj)
+    return out
+
+
 def _collect_world_anchor_objects(robot: Any) -> List[Tuple[str, Any, Pose2D]]:
     """Collect (anchor_name, obj, Pose2D) tuples matching robot.pose.origin_id."""
     assert robot is not None, "robot required"
@@ -261,7 +285,7 @@ def _collect_world_anchor_objects(robot: Any) -> List[Tuple[str, Any, Pose2D]]:
         return []
     out: List[Tuple[str, Any, Pose2D]] = []
     candidates: List[Any] = [getattr(world, "charger", None), getattr(world, "connected_light_cube", None)]
-    candidates.extend(list(getattr(world, "visible_objects", []) or []))
+    candidates.extend(_iter_visible_world_objects(world))
     assert rpose is not None
     for obj in candidates:
         name = anchor_name_from_object(obj)
@@ -690,12 +714,79 @@ def _grow_box(occ: set[Tuple[int, int]], ix0: int, iy0: int) -> Tuple[int, int]:
     return (ix1, iy1)
 
 
+def _box_overlaps_circle(
+    bx_mm: float,
+    by_mm: float,
+    sx_mm: float,
+    sy_mm: float,
+    angle_rad: float,
+    cx_mm: float,
+    cy_mm: float,
+    radius_mm: float,
+) -> bool:
+    """Return True if an oriented XY rectangle intersects a clearance circle."""
+    assert sx_mm >= 0.0 and sy_mm >= 0.0 and radius_mm >= 0.0
+    dx, dy = cx_mm - bx_mm, cy_mm - by_mm
+    c, s = math.cos(-angle_rad), math.sin(-angle_rad)
+    lx, ly = c * dx - s * dy, s * dx + c * dy
+    px = max(-0.5 * sx_mm, min(0.5 * sx_mm, lx))
+    py = max(-0.5 * sy_mm, min(0.5 * sy_mm, ly))
+    return (lx - px) ** 2 + (ly - py) ** 2 <= radius_mm * radius_mm
+
+
+def _rect_corners(cx: float, cy: float, sx: float, sy: float) -> Tuple[Tuple[float, float], ...]:
+    """Return four corners of an axis-aligned rectangle centered at (cx, cy)."""
+    hx, hy = 0.5 * sx, 0.5 * sy
+    return ((cx - hx, cy - hy), (cx + hx, cy - hy), (cx + hx, cy + hy), (cx - hx, cy + hy))
+
+
+def _box_overlaps_charger(
+    cx_can: float,
+    cy_can: float,
+    sx_mm: float,
+    sy_mm: float,
+    charger_pose_can: Pose2D,
+    bounds: Tuple[float, float, float, float],
+) -> bool:
+    """Exact 2D SAT overlap check between canonical obstacle AABB and oriented charger corridor."""
+    xmin, xmax, ymin, ymax = bounds
+    assert xmin <= xmax and ymin <= ymax and sx_mm >= 0.0 and sy_mm >= 0.0
+    tf_to_chg = Transform2D(charger_pose_can.x_mm, charger_pose_can.y_mm, charger_pose_can.theta_rad).invert()
+    in_chg = [tf_to_chg.apply_point(x, y) for x, y in _rect_corners(cx_can, cy_can, sx_mm, sy_mm)]
+    if max(p[0] for p in in_chg) < xmin or min(p[0] for p in in_chg) > xmax:
+        return False
+    if max(p[1] for p in in_chg) < ymin or min(p[1] for p in in_chg) > ymax:
+        return False
+    tf_to_can = tf_to_chg.invert()
+    chg_corners = [tf_to_can.apply_point(x, y) for x in (xmin, xmax) for y in (ymin, ymax)]
+    bx0, bx1 = cx_can - 0.5 * sx_mm, cx_can + 0.5 * sx_mm
+    by0, by1 = cy_can - 0.5 * sy_mm, cy_can + 0.5 * sy_mm
+    if max(p[0] for p in chg_corners) < bx0 or min(p[0] for p in chg_corners) > bx1:
+        return False
+    return not (max(p[1] for p in chg_corners) < by0 or min(p[1] for p in chg_corners) > by1)
+
+
+def canonical_charger_pose(atlas: NavMapAtlas) -> Optional[Pose2D]:
+    """Return charger Pose2D in canonical coordinates if an anchor is registered."""
+    assert isinstance(atlas, NavMapAtlas)
+    for key in ("charger", "charger_seated"):
+        for sid, amap in atlas.anchors.items():
+            tf = atlas.transforms_to_canonical.get(sid)
+            if key in amap and tf is not None:
+                return tf.apply_pose(amap[key], target_origin_id=0)
+    return None
+
+
 def rehydrate_onboard_obstacles(
     robot: Any,
     atlas: NavMapAtlas,
     submap_id: str,
     max_boxes: int = 48,
     wall_height_mm: float = 80.0,
+    robot_pose_bot: Optional[Pose2D] = None,
+    robot_clear_radius_mm: float = 110.0,
+    charger_pose_can: Optional[Pose2D] = None,
+    charger_clear_bounds_mm: Tuple[float, float, float, float] = (-40.0, 220.0, -90.0, 90.0),
 ) -> int:
     """Inject canonical obstacle boxes back into Vector's active origin via FixedCustomObject."""
     from anki_vector.util import Pose, radians  # type: ignore
@@ -707,16 +798,23 @@ def rehydrate_onboard_obstacles(
     boxes = compress_occupied_to_boxes(atlas, max_boxes=max_boxes)
     if not boxes:
         return 0
+    kept: List[Tuple[float, float, float, float, float, float]] = []
+    for cx, cy, sx, sy in boxes:
+        if charger_pose_can is not None and _box_overlaps_charger(cx, cy, sx, sy, charger_pose_can, charger_clear_bounds_mm):
+            continue
+        bx, by = tf_to_bot.apply_point(cx, cy)
+        if robot_pose_bot is not None and _box_overlaps_circle(bx, by, sx, sy, tf_to_bot.dtheta_rad, robot_pose_bot.x_mm, robot_pose_bot.y_mm, robot_clear_radius_mm):
+            continue
+        kept.append((bx, by, sx, sy, tf_to_bot.dtheta_rad, wall_height_mm))
     robot.world.delete_custom_objects(
         delete_custom_marker_objects=False,
         delete_fixed_custom_objects=True,
         delete_custom_object_archetypes=False,
     )
-    created = 0
+    if not kept:
+        return 0
     oid = int(getattr(robot.pose, "origin_id", 0))
-    for cx, cy, sx, sy in boxes:
-        bx, by = tf_to_bot.apply_point(cx, cy)
-        pose = Pose(bx, by, wall_height_mm * 0.5, angle_z=radians(tf_to_bot.dtheta_rad), origin_id=oid)
-        robot.world.create_custom_fixed_object(pose, x_size_mm=sx, y_size_mm=sy, z_size_mm=wall_height_mm, use_robot_origin=True)
-        created += 1
-    return created
+    for bx, by, sx, sy, theta, h_mm in kept:
+        pose = Pose(bx, by, h_mm * 0.5, angle_z=radians(theta), origin_id=oid)
+        robot.world.create_custom_fixed_object(pose, x_size_mm=sx, y_size_mm=sy, z_size_mm=h_mm, use_robot_origin=True)
+    return len(kept)

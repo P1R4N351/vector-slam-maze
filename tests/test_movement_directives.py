@@ -361,7 +361,7 @@ class MovementDirectivesTests(unittest.TestCase):
             f"import sys; sys.path.insert(0, {repo_root!r}); "
             "sys.modules['numpy']=None; sys.modules['PIL']=None; "
             "import vector_slam_maze, vector_slam_maze.movement_directives, vector_slam_maze.navmap_atlas, vector_slam_maze.mechanism_characterize; "
-            "assert vector_slam_maze.__version__ == '0.4.4'; "
+            "assert vector_slam_maze.__version__ == '0.5.1'; "
             "mr = vector_slam_maze.MotionResult(True, 'completed', 50.0, 0.0); "
             "assert mr.moved_mm == 50.0"
         )

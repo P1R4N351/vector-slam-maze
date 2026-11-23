@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import Any, List
 
+from .basal_persist import (
+    BasalConfig,
+    BasalMapDaemon,
+    export_seated_navmap,
+    export_seated_navmap_dict,
+)
 from .cliff_guard import CliffGuard, CliffHazard, GuardedRobot
 from .maze_solver import FloodFillPlanner, MazeGrid, RightWallFollower
 from .movement_directives import (
@@ -20,10 +26,17 @@ from .movement_directives import (
     plan_directive,
     plan_directive_batch,
 )
-from .navmap_atlas import NavMapAtlas, SubmapLayer, compress_occupied_to_boxes, extract_quadtree_leaves
+from .navmap_atlas import (
+    NavMapAtlas,
+    SubmapLayer,
+    canonical_charger_pose,
+    compress_occupied_to_boxes,
+    extract_quadtree_leaves,
+    rehydrate_onboard_obstacles,
+)
 from .types_and_math import NavContent, Pose2D, Transform2D, fit_se2_from_anchors
 
-__version__ = "0.4.4"
+__version__ = "0.5.1"
 
 _LAZY_EXPORTS = {
     "CameraIntrinsics": "sensor_bridge",
@@ -47,6 +60,8 @@ _LAZY_EXPORTS = {
 }
 
 __all__ = [
+    "BasalConfig",
+    "BasalMapDaemon",
     "CameraIntrinsics",
     "CliffGuard",
     "CliffHazard",
@@ -72,6 +87,7 @@ __all__ = [
     "assess_illumination",
     "bounded_drive",
     "bounded_turn",
+    "canonical_charger_pose",
     "check_ros2_environment",
     "compress_occupied_to_boxes",
     "estimate_rolling_shutter_metrics",
@@ -79,6 +95,8 @@ __all__ = [
     "evaluate_visual_vs_odom_drift",
     "execute_bounded_directive",
     "execute_directive_batch",
+    "export_seated_navmap",
+    "export_seated_navmap_dict",
     "export_slam_dataset",
     "extract_quadtree_leaves",
     "fit_braking_response",
@@ -90,6 +108,7 @@ __all__ = [
     "phase_correlate_1d_shift",
     "plan_directive",
     "plan_directive_batch",
+    "rehydrate_onboard_obstacles",
     "run_mechanism_characterization",
     "synthesize_laserscan_from_tof_and_atlas",
 ]
